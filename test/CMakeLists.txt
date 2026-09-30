@@ -104,7 +104,7 @@ target_link_libraries(DspTests
         # NAM must be linked whole-archive so its self-registering config
         # parsers (WaveNet/ConvNet/LSTM static initializers) survive the
         # linker (same recipe as plugin/CMakeLists.txt).
-        $<$<PLATFORM_ID:Darwin>:-Wl,-force_load,$<TARGET_FILE:NAM>>
+        $<$<PLATFORM_ID:Darwin>:$<LINK_LIBRARY:WHOLE_ARCHIVE,NAM>>
         $<$<PLATFORM_ID:Linux>:-Wl,--whole-archive>
         $<$<PLATFORM_ID:Linux>:NAM>
         $<$<PLATFORM_ID:Linux>:-Wl,--no-whole-archive>

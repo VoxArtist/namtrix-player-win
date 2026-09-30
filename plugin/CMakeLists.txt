@@ -18,8 +18,8 @@ elseif(NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET OR CMAKE_OSX_DEPLOYMENT_TARGET ST
 endif()
 
 # Required by JUCE (Change these to project specs)
-set(PLUGIN_NAME "TONE3000")            # Name of the plugin (used in the UI)
-set(PLUGIN_CODE T3K0)                # Unique 4-letter code for the plugin
+set(PLUGIN_NAME "NAMTRIX Player")      # Name of the plugin (used in the UI)
+set(PLUGIN_CODE Nmxp)                # Unique 4-letter code for the plugin
 
 # Version comes from the repo-root VERSION file (single source of truth;
 # bump with script/set-version.sh). Read here too so this directory still
@@ -126,6 +126,14 @@ add_library(NAM STATIC
     ${NAM_SRC}/wavenet/a2_fast.cpp
     ${NAM_SRC}/wavenet/model.cpp
     ${NAM_SRC}/wavenet/slimmable.cpp
+    # --- parametric fork additions ---
+    ${NAM_SRC}/linear.cpp
+    ${NAM_SRC}/parametric_control.cpp
+    ${NAM_SRC}/parametric_version.cpp
+    ${NAM_SRC}/concat_lstm.cpp
+    ${NAM_SRC}/hypernet.cpp
+    ${NAM_SRC}/wavenet/concat_wavenet.cpp
+    ${NAM_SRC}/wavenet/hyperwavenet.cpp
 )
 target_include_directories(NAM PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/NeuralAmpModelerCore
@@ -221,7 +229,7 @@ else()
 endif()
 
 juce_add_plugin(${PROJECT_NAME}
-    COMPANY_NAME TONE3000
+    COMPANY_NAME NAMTRIX
     PLUGIN_NAME ${PLUGIN_NAME}
     IS_SYNTH FALSE
     # Pro Tools insert folders. Unset is None ("Other"). Harmonic is where
@@ -232,22 +240,22 @@ juce_add_plugin(${PROJECT_NAME}
     # hosts route their MIDI to us, standalone merges enabled MIDI inputs.
     NEEDS_MIDI_INPUT TRUE
     NEEDS_MIDI_OUTPUT FALSE
-    PLUGIN_MANUFACTURER_CODE TFTF
+    PLUGIN_MANUFACTURER_CODE Nmtx
     PLUGIN_CODE ${PLUGIN_CODE}
     FORMATS ${_plugin_formats}
     # The LV2 URI is the plugin's permanent identity in LV2 hosts (it keys
     # sessions and presets). Never change it once released.
-    LV2URI "https://www.tone3000.com/plugin"
-    PRODUCT_NAME ${PROJECT_NAME}
+    LV2URI "https://namtrix.local/plugin"
+    PRODUCT_NAME "NAMTRIX Player"
     NEEDS_WEB_BROWSER ${NEEDS_WEB_BROWSER_VALUE}
     VST3_AUTO_MANIFEST ${VST3_MANIFEST}
     NEEDS_WEBVIEW2 ${NEEDS_WEBVIEW2_VALUE}
     MICROPHONE_PERMISSION_ENABLED TRUE
-    MICROPHONE_PERMISSION_TEXT "TONE3000 needs microphone access for audio input processing."
+    MICROPHONE_PERMISSION_TEXT "NAMTRIX Player needs microphone access for audio input processing."
     # Without this Info.plist key, macOS TCC kills the app the moment the
     # Bluetooth MIDI pairing dialog touches CoreBluetooth.
     BLUETOOTH_PERMISSION_ENABLED TRUE
-    BLUETOOTH_PERMISSION_TEXT "TONE3000 uses Bluetooth to find and pair Bluetooth MIDI controllers."
+    BLUETOOTH_PERMISSION_TEXT "NAMTRIX Player uses Bluetooth to find and pair Bluetooth MIDI controllers."
     # Publish the launch floor in Info.plist too. The Mach-O slices already
     # carry their minimums (10.15 Intel, 11.0 arm64), but Launch Services and
     # Finder's Get Info read LSMinimumSystemVersion, and without it the app
@@ -456,7 +464,7 @@ target_link_libraries(${PROJECT_NAME}
         # PLATFORM_ID is "iOS" (not "Darwin") when cross-compiling for iOS, so
         # both have to be listed or the iOS link drops every model architecture
         # and NAM loads fail with "No config parser registered for ...".
-        $<$<PLATFORM_ID:Darwin,iOS>:-Wl,-force_load,$<TARGET_FILE:NAM>>
+        $<$<PLATFORM_ID:Darwin,iOS>:$<LINK_LIBRARY:WHOLE_ARCHIVE,NAM>>
         # Linux: flags and library must be separate link items. A single
         # "-Wl,--whole-archive,NAM,-Wl,..." item gets comma-split by the GCC
         # driver, passing a literal "-Wl" to ld ("unrecognized option '-Wl'").
