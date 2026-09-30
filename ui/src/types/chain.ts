@@ -83,6 +83,25 @@ export function isSlimSizeFull(slimSize: number): boolean {
   return slimSize >= 0.5;
 }
 
+/**
+ * One knob of a parametric NAM model, as the model itself declares it
+ * (`config.params` in the .nam). Snapshot models declare none.
+ *
+ * `min`/`max`/`default` are in the knob's own units -- the numbers printed on
+ * the real faceplate -- not normalized. `switch` params are a discrete choice:
+ * the value is an integer index into `enumNames`, and native rejects anything
+ * non-integral, so the UI must send whole numbers for them.
+ */
+export interface NamParamSpec {
+  name: string;
+  min: number;
+  max: number;
+  default: number;
+  type: 'continuous' | 'switch';
+  /** Present only for `switch`; the value indexes into this. */
+  enumNames?: string[];
+}
+
 /** Per-block user-editable parameters (all persisted with the plugin state). */
 export interface BlockParams {
   /** Block participates in processing (per-block on/off). */
@@ -97,6 +116,11 @@ export interface BlockParams {
       `setBlockSlimSize`, not `setBlockParam`: changing it retiers the
       loaded engine natively. */
   slimSize: number;
+  /** Parametric NAM knob positions, in the model's own units, positionally
+      matched to `ToneBlock.namParamSpecs`. Absent for snapshot models. Set
+      via `setBlockNamParam` (one knob at a time, so a drag coalesces into a
+      single undo step). */
+  namParamValues?: number[];
   /** Normalized 0..1; 0.5 = unity, ±24 dB. Drives the block's DSP. */
   inputGain: number;
   /** Normalized 0..1; 0.5 = unity, ±24 dB. */
@@ -190,6 +214,12 @@ export interface ToneBlock {
       in Processor.cpp). Both are guaranteed finite by native. */
   inputLevelDbu?: number;
   outputLevelDbu?: number;
+  /** Knob specs for a parametric NAM model (ConcatWaveNet / HyperWaveNet /
+      ConcatLSTM), read off the loaded engine. Absent for snapshot models and
+      until the model loads, which is what the UI keys off to decide whether
+      to render a knob row at all. Positionally matched to
+      `params.namParamValues`. */
+  namParamSpecs?: NamParamSpec[];
   params: BlockParams;
 }
 

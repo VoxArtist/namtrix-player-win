@@ -352,7 +352,10 @@ export const ToneImage: React.FC<{
   React.useEffect(() => setFailed(false), [src]);
   const glyphSize = iconSize ?? Math.round(boxSize * 0.4);
 
-  if (local) {
+  // A local tone normally has no artwork, so it falls back to a file glyph.
+  // It does get one when an image sits beside the model file (same base name),
+  // which native stashes and serves -- use it like any other tone image.
+  if (local && (!src || failed)) {
     return (
       <div
         style={{

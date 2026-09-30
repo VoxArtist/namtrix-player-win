@@ -6,7 +6,9 @@ import { IconButton } from './IconButton';
 import { PresetBar } from './PresetBar';
 import { StereoModeToggle } from './StereoModeToggle';
 import { HELP } from './helpText';
-import { BORDER } from './theme';
+import { BORDER, FONT_MONO, MUTED, WHITE } from './theme';
+import { NAMTRIX_VERSION } from '../version';
+import { isLightColor, useBackgroundColors } from './backgroundTheme';
 import type { usePresets } from '../hooks/usePresets';
 import type { ActivePreset } from '../types/chain';
 import type { User } from '../types/tone';
@@ -74,6 +76,10 @@ export const PluginHeader = React.memo(function PluginHeader({
   onLogin,
   onLogout,
 }: PluginHeaderProps) {
+  // The wordmark and its type flip to black when the background behind them
+  // is light enough that white would wash out.
+  const onLight = isLightColor(useBackgroundColors().start);
+
   return (
     <div
       style={{
@@ -83,20 +89,66 @@ export const PluginHeader = React.memo(function PluginHeader({
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'space-between',
-        backgroundColor: '#000000',
+        // Transparent so the window gradient reaches the top-left corner,
+        // where the first colour stop is anchored. The bottom border still
+        // separates the bar from the content.
+        backgroundColor: 'transparent',
         padding: '0 24rem',
         boxSizing: 'border-box',
         borderBottom: BORDER,
       }}
     >
-      <a
-        href="https://www.tone3000.com"
-        target="_blank"
-        rel="noopener noreferrer"
-        style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '16rem' }}
-      >
-        <img src="/t3k.svg" alt="T3K" style={{ width: '160rem' }} />
-      </a>
+      {/* NAMTRIX Player wordmark. Sized by height, not width: the art is a
+        wide 2.5:1 marquee and the header is a fixed 64rem, so pinning the
+        height is what keeps it inside the bar whatever the art's dimensions.
+        No longer a link -- it used to open tone3000.com, which is not where
+        this build comes from. */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '10rem' }}>
+        {/* Two cuts of the same wordmark. The header sits at the top-left,
+          which is where the gradient's first stop is, so that colour decides
+          which one keeps its contrast. */}
+        <img
+          src={onLight ? '/namtrix-logo-dark.png' : '/namtrix-logo.png'}
+          alt="NAMTRIX Player"
+          style={{ height: '30rem', width: 'auto', display: 'block' }}
+        />
+        {/* Product name beside the wordmark: the logo art is the NAMTRIX
+          marquee alone, so what this build *is* gets said in type. Stacked
+          over the build version, which is bumped on every edit so a stale
+          WebView bundle is immediately obvious. */}
+        <span
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            justifyContent: 'center',
+            lineHeight: 1.15,
+            whiteSpace: 'nowrap',
+          }}
+        >
+          <span
+            style={{
+              fontFamily: FONT_MONO,
+              fontSize: '13rem',
+              fontWeight: 400,
+              color: onLight ? '#000000' : WHITE,
+              letterSpacing: '0.06em',
+              textTransform: 'uppercase',
+            }}
+          >
+            Parametric Player
+          </span>
+          <span
+            style={{
+              fontFamily: FONT_MONO,
+              fontSize: '10rem',
+              fontWeight: 400,
+              color: onLight ? 'rgba(0, 0, 0, 0.55)' : MUTED,
+            }}
+          >
+            {NAMTRIX_VERSION}
+          </span>
+        </span>
+      </div>
       {/* 40px between header items; tight pairs (undo/redo) group inside. */}
       <div style={{ display: 'flex', alignItems: 'center', gap: '40rem' }}>
         <PresetBar

@@ -33,6 +33,14 @@ import {
   outlinedFieldStyle,
   sectionLabelStyle,
 } from './controls';
+import {
+  DEFAULT_BG_END,
+  DEFAULT_BG_START,
+  backgroundGradient,
+  resetBackgroundColors,
+  setBackgroundColors,
+  useBackgroundColors,
+} from './backgroundTheme';
 import { SystemSettings } from './SystemSettings';
 import { MidiMapSettings } from './MidiMapSettings';
 
@@ -289,8 +297,105 @@ export const Settings: React.FC<SettingsProps> = ({
     </div>
   );
 
+/** A labelled colour well. `input[type=color]` opens the OS picker, which is
+    the right control here: these are free-form colours, not a palette. The
+    native input is sized to fill the well and its own chrome trimmed away. */
+const ColorSwatch: React.FC<{
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+}> = ({ label, value, onChange }) => (
+  <label style={{ display: 'flex', flexDirection: 'column', gap: '6rem' }}>
+    <span style={{ ...descriptionStyle, margin: 0 }}>{label}</span>
+    <span
+      style={{
+        width: '56rem',
+        height: '40rem',
+        borderRadius: '8rem',
+        border: FIELD_BORDER,
+        overflow: 'hidden',
+        display: 'block',
+        backgroundColor: value,
+      }}
+    >
+      <input
+        type="color"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        style={{
+          width: '200%',
+          height: '200%',
+          margin: '-25%',
+          padding: 0,
+          border: 'none',
+          background: 'transparent',
+          cursor: 'pointer',
+        }}
+      />
+    </span>
+  </label>
+);
+
+  const bgColors = useBackgroundColors();
+  const isDefaultBackground =
+    bgColors.start === DEFAULT_BG_START && bgColors.end === DEFAULT_BG_END;
+
   const pluginTab = (
     <>
+      <div style={{ marginBottom: `${SECTION_GAP}rem` }}>
+        <span style={sectionLabelStyle}>Background</span>
+        <p style={descriptionStyle}>
+          Tints the background plate. The first colour sits in the top-left corner, the second
+          in the bottom-right; grey leaves the plate untinted.
+        </p>
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '16rem',
+            marginTop: '16rem',
+          }}
+        >
+          <ColorSwatch
+            label="Top left"
+            value={bgColors.start}
+            onChange={(value) => setBackgroundColors(value, bgColors.end)}
+          />
+          <ColorSwatch
+            label="Bottom right"
+            value={bgColors.end}
+            onChange={(value) => setBackgroundColors(bgColors.start, value)}
+          />
+          {/* Live preview of the pair, so the result is visible without
+            closing Settings to look at the window behind it. */}
+          <div
+            aria-hidden
+            style={{
+              flex: 1,
+              minWidth: 0,
+              height: '40rem',
+              borderRadius: '8rem',
+              border: FIELD_BORDER,
+              background: backgroundGradient(bgColors.start, bgColors.end),
+            }}
+          />
+          <button
+            type="button"
+            onClick={resetBackgroundColors}
+            disabled={isDefaultBackground}
+            style={{
+              ...outlinedFieldStyle,
+              padding: '8rem 14rem',
+              whiteSpace: 'nowrap',
+              cursor: isDefaultBackground ? 'not-allowed' : 'pointer',
+              opacity: isDefaultBackground ? 0.45 : 1,
+            }}
+          >
+            Reset
+          </button>
+        </div>
+      </div>
+
       <ToggleRow
         label="Info Bar"
         description="Strip under the faceplate with hover tips and CPU load."

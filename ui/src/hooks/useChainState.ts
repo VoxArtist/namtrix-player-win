@@ -73,6 +73,7 @@ export function useChainState() {
       setStereoMode: backend.getPluginFunction('setStereoMode'),
       setInputMode: backend.getPluginFunction('setInputMode'),
       setBlockSlimSize: backend.getPluginFunction('setBlockSlimSize'),
+      setBlockNamParam: backend.getPluginFunction('setBlockNamParam'),
       setNamSlimSizeDefault: backend.getPluginFunction('setNamSlimSizeDefault'),
       setMultiCore: backend.getPluginFunction('setMultiCore'),
       setActiveEditChain: backend.getPluginFunction('setActiveEditChain'),
@@ -203,6 +204,12 @@ export function useChainState() {
           part of the chain state, so it lands in presets and undo. */
       setBlockSlimSize: (blockId: string, slimSize: number) =>
         run<boolean>('setBlockSlimSize', () => native.setBlockSlimSize(blockId, slimSize)),
+      /** One knob of a parametric NAM model, by its index into the block's
+          `namParamSpecs`. `value` is in the knob's own units (not
+          normalized); native clamps it to the spec and rounds switches.
+          Single-knob so a drag coalesces into one undo step. */
+      setBlockNamParam: (blockId: string, index: number, value: number) =>
+        run<boolean>('setBlockNamParam', () => native.setBlockNamParam(blockId, index, value)),
       /** Default NAM A2 size for newly added blocks (machine-wide; existing
           blocks keep their own size). Persists on disk. */
       setNamSlimSizeDefault: (slimSize: number) =>

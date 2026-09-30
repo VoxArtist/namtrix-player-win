@@ -18,6 +18,7 @@ import { RetryLoadBadge } from './RetryLoadBadge';
 import { meterId } from '../hooks/useMeters';
 import { useChainActions } from '../hooks/useChainActions';
 import { HELP, helpProps, toneTileHelp } from './helpText';
+import { ParametricBadge } from './ParametricBadge';
 import type { ChainSide, ToneBlock } from '../types/chain';
 import { ChromeIconButton } from './ChromeIconButton';
 import { TileMenu } from './TileMenu';
@@ -480,9 +481,23 @@ export const GalleryBlock: React.FC<GalleryBlockProps> = React.memo(
       if (error) toast.show(error);
     };
 
+    // Name of the model actually loaded, for the hover tooltip. A tone can
+    // hold several models (a folder load, or a catalog tone's sizes), so the
+    // active one is more informative than the tone title.
+    const activeModelName =
+      block.tone.models?.find((model) => model.id === block.activeModelId)?.name ??
+      block.tone.title;
+
+    const parametricCount = block.namParamSpecs?.length ?? 0;
+
     return (
       <div
         ref={ref}
+        title={
+          parametricCount > 0
+            ? `${activeModelName} \u2014 ${parametricCount} knobs`
+            : activeModelName
+        }
         onContextMenu={openMenu}
         {...longPressProps}
         onDragOver={(e) => armFileDrag(e, setDropArmed)}
@@ -499,6 +514,22 @@ export const GalleryBlock: React.FC<GalleryBlockProps> = React.memo(
           zIndex: menuAnchor ? 5 : undefined,
         }}
       >
+        {parametricCount > 0 && (
+          <div
+            style={{
+              position: 'absolute',
+              top: '5rem',
+              right: '5rem',
+              // Above the artwork, below the action sheet (zIndex 5 on the
+              // wrapper) and out of the way of the tile's own buttons.
+              zIndex: 2,
+              pointerEvents: 'none',
+            }}
+          >
+            <ParametricBadge size={13} />
+          </div>
+        )}
+
         <TileSurface
           block={block}
           size={size}

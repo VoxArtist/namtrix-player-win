@@ -1,6 +1,7 @@
 import React from 'react';
 import { rem } from '../hooks/useUiScale';
 import { FONT_MONO } from './theme';
+import { ParametricBadge } from './ParametricBadge';
 
 /** The web app's A2-architecture mark (gradient "A2" rounded square), a
     touch taller than the format badge. The gradient id is per-instance: a
@@ -38,8 +39,14 @@ const A2Mark: React.FC<{ size?: number }> = ({ size = 18 }) => {
 
 /** Format tag (NAM / IR / …) matching the web ToneCard badge:
     zinc-400 background, black mono text, 2px corners. `a2` appends the A2
-    architecture mark (NAM tones the plugin can actually load). */
-export const FormatBadge: React.FC<{ label: string; a2?: boolean }> = ({ label, a2 = false }) => (
+    architecture mark (NAM tones the plugin can actually load), and
+    `parametric` marks a model that carries its own knobs. The parametric mark
+    sits between the two: it qualifies the format, not the architecture. */
+export const FormatBadge: React.FC<{ label: string; a2?: boolean; parametric?: boolean }> = ({
+  label,
+  a2 = false,
+  parametric = false,
+}) => (
   <span
     style={{
       display: 'inline-flex',
@@ -63,6 +70,7 @@ export const FormatBadge: React.FC<{ label: string; a2?: boolean }> = ({ label, 
     >
       {label}
     </span>
+    {parametric && <ParametricBadge size={16} />}
     {a2 && <A2Mark />}
   </span>
 );

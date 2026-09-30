@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft,
   ArrowLeftRight,
@@ -15,6 +15,7 @@ import {
 import { ToneImage } from './GearIcon';
 import { rem } from '../hooks/useUiScale';
 import { KnobControl } from './KnobControl';
+import { NamParamKnobs } from './NamParamKnobs';
 import { gainDbScale } from './knobScale';
 import { BusyOverlay, LoadingDots } from './LoadingDots';
 import { ModelSelect } from './ModelSelect';
@@ -283,6 +284,32 @@ export const ChainBlock: React.FC<ChainBlockProps> = ({
   useEffect(() => {
     if (!knobDragRef.current) setMix(params.mix ?? 1.0);
   }, [params.mix]);
+  // Parametric NAM knobs. Held locally while dragging for the same reason as
+  // the gain knobs: the chain poll would otherwise hand back a pre-drag value
+  // mid-gesture. The specs come off the loaded model, so this stays empty for
+  // snapshot models and until the model finishes loading.
+  const namParamSpecs = useMemo(() => block.namParamSpecs ?? [], [block.namParamSpecs]);
+  const [namParamValues, setNamParamValues] = useState<number[]>(
+    () => params.namParamValues ?? []
+  );
+  useEffect(() => {
+    if (!knobDragRef.current) setNamParamValues(params.namParamValues ?? []);
+  }, [params.namParamValues]);
+
+  const setNamParam = useCallback(
+    (index: number, value: number) => {
+      setNamParamValues((prev) => {
+        const next = prev.length === namParamSpecs.length
+          ? [...prev]
+          : namParamSpecs.map((spec) => spec.default);
+        next[index] = value;
+        return next;
+      });
+      actions.setBlockNamParam(blockId, index, value);
+    },
+    [actions, blockId, namParamSpecs]
+  );
+
   useEffect(() => setEqOn(params.eq?.enabled ?? true), [params.eq?.enabled]);
   useEffect(() => setEqPre(params.eq?.pre ?? false), [params.eq?.pre]);
 
@@ -611,6 +638,7 @@ export const ChainBlock: React.FC<ChainBlockProps> = ({
             position: 'relative',
             width: '100%',
             height: showInfo ? undefined : `${CARD_HEIGHT}rem`,
+            // The card never shrinks below the Figma height, knobs or not.
             minHeight: `${CARD_HEIGHT}rem`,
             boxSizing: 'border-box',
             border: BORDER,
@@ -969,8 +997,39 @@ export const ChainBlock: React.FC<ChainBlockProps> = ({
                                 {gearLabel(tone.gear)}
                               </span>
                             )}
-                            {formatBadge && <FormatBadge label={formatBadge} a2={isNam} />}
+                            {formatBadge && (
+                              <FormatBadge
+                                label={formatBadge}
+                                a2={isNam}
+                                parametric={namParamSpecs.length > 0}
+                              />
+                            )}
                           </div>
+
+                          {/* Parametric NAM knobs. They live in this column,
+                            not below the body: the card is a fixed height with
+                            overflow:hidden, so a row underneath is clipped, and
+                            growing the card pushes its bottom past the window.
+                            The column already has slack here. Capped with its
+                            own scroll so a model with many knobs can't push the
+                            title and badges out of the card. */}
+                          {namParamSpecs.length > 0 && (
+                            <div
+                              className="hide-scrollbar"
+                              style={{
+                                marginTop: '8rem',
+                                maxHeight: '150rem',
+                                overflowY: 'auto',
+                              }}
+                            >
+                              <NamParamKnobs
+                                specs={namParamSpecs}
+                                values={namParamValues}
+                                onChange={setNamParam}
+                                onDragStateChange={handleKnobDragState}
+                              />
+                            </div>
+                          )}
                         </div>
 
                         {!isLocal && (

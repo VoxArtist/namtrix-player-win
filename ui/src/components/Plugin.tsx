@@ -30,6 +30,7 @@ import Settings, { type SettingsTab } from './Settings';
 import { T3K_API } from '../t3k/config';
 import type { Model } from '../types/tone';
 import type { ToneBlock } from '../types/chain';
+import { backgroundGradient, useBackgroundColors } from './backgroundTheme';
 
 export const Plugin: React.FC = () => {
   const [showSettings, setShowSettings] = useState(false);
@@ -342,6 +343,8 @@ export const Plugin: React.FC = () => {
   // Single stable bundle of everything a block can do. ChainView and the
   // tiles/cards below it read this from context instead of threading a dozen
   // callback props (which would defeat their React.memo).
+  const bgColors = useBackgroundColors();
+
   const chainActions = useMemo<ChainActions>(
     () => ({
       addModel: loadFlow.handleAddModel,
@@ -366,6 +369,7 @@ export const Plugin: React.FC = () => {
       refreshToneMetadata: actions.refreshToneMetadata,
       setBlockParam: actions.setBlockParam,
       setBlockSlimSize: actions.setBlockSlimSize,
+      setBlockNamParam: actions.setBlockNamParam,
       setBlockEqBand: actions.setBlockEqBand,
       setBlockEqEnabled: actions.setBlockEqEnabled,
       setBlockEqPre: actions.setBlockEqPre,
@@ -407,7 +411,27 @@ export const Plugin: React.FC = () => {
         transition: chrome.animating ? `height ${BANNER_ANIM_MS}ms ease` : undefined,
         display: 'flex',
         flexDirection: 'column',
-        backgroundColor: '#000000',
+        // Brushed-metal plate, with the user's corner-to-corner colours
+        // (Settings > Background) laid over it as a tint.
+        //
+        // Order matters: CSS paints the FIRST background-image on top, so the
+        // gradient sits over the photo. soft-light is the blend whose no-op
+        // point is mid-grey, which is why the shipped default is neutral grey
+        // at both stops -- out of the box you see the plate exactly as it is,
+        // and picking colours tints it rather than covering it.
+        //
+        // Both layers live on this one element rather than an overlay div, so
+        // the result still paints behind every child and nothing in the UI
+        // needs a stacking context or pointer-events opt-out to stay usable.
+        backgroundImage: `${backgroundGradient(
+          bgColors.start,
+          bgColors.end
+        )}, url('/bg-metal.jpg')`,
+        backgroundBlendMode: 'soft-light',
+        // The plate is authored at the window's tallest design state, so
+        // cover crops rather than magnifies and the scratches stay crisp.
+        backgroundSize: 'cover',
+        backgroundPosition: 'center',
         boxSizing: 'border-box',
         overflow: 'hidden',
         color: '#ffffff',
@@ -473,7 +497,9 @@ export const Plugin: React.FC = () => {
               flexDirection: 'row',
               flex: 1,
               width: '100%',
-              backgroundColor: '#000000',
+              // Transparent: this row spans the whole middle of the window,
+              // so painting it black would hide the root's gradient entirely.
+              backgroundColor: 'transparent',
               overflow: 'hidden',
               minHeight: 0,
               padding: '0 24rem',
@@ -487,7 +513,10 @@ export const Plugin: React.FC = () => {
                 alignItems: 'center',
                 justifyContent: 'center',
                 flexShrink: 0,
-                backgroundColor: '#000000',
+                // Transparent so the window gradient runs behind the meter
+                // rails. The zIndex below, not this colour, is what keeps
+                // overflowing stereo columns above the Select Tone scrim.
+                backgroundColor: 'transparent',
                 // Above the Select Tone header scrim, so stereo columns that
                 // overflow this slot into the center aren't covered by it.
                 position: 'relative',
@@ -552,7 +581,10 @@ export const Plugin: React.FC = () => {
                 alignItems: 'center',
                 justifyContent: 'center',
                 flexShrink: 0,
-                backgroundColor: '#000000',
+                // Transparent so the window gradient runs behind the meter
+                // rails. The zIndex below, not this colour, is what keeps
+                // overflowing stereo columns above the Select Tone scrim.
+                backgroundColor: 'transparent',
                 // Above the Select Tone header scrim, so stereo columns that
                 // overflow this slot into the center aren't covered by it.
                 position: 'relative',
