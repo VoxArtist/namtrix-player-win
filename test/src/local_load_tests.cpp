@@ -139,6 +139,95 @@ TEST(LocalLoadTest, IrMixDefaultsFollowKernelLength) {
   }
 }
 
+// Parametric (knob-conditioned) NAM: the drop-time gate admits the
+// architecture, the loaded engine surfaces its knob specs on the block, and
+// setBlockNamParam moves a knob and is reflected back in the chain state.
+// Snapshot models must keep surfacing no specs at all, which is what the UI
+// keys off to decide whether to draw a knob row.
+TEST(LocalLoadTest, ParametricNamExposesKnobsAndAcceptsEdits) {
+  TONE3000Processor proc;
+  const juce::var res = proc.loadLocalTone(
+      "parametric-concat-test", filesOf({testFileEntry("parametric-concat-test.nam")}));
+  EXPECT_TRUE(res["error"].isVoid()) << res["error"].toString().toStdString();
+  const juce::String blockId = res["blockId"].toString();
+  ASSERT_TRUE(blockId.isNotEmpty());
+  ASSERT_TRUE(waitForChainLoaded(proc));
+
+  const juce::var block = firstToneBlock(proc);
+  const juce::var specsVar = block["namParamSpecs"];
+  const auto* specs = specsVar.getArray();
+  ASSERT_NE(specs, nullptr) << "parametric model surfaced no knob specs";
+  ASSERT_EQ(specs->size(), 2);
+
+  // Spec 0: a continuous gain over its faceplate range, not a normalized 0..1.
+  EXPECT_EQ((*specs)[0]["name"].toString(), juce::String("gain"));
+  EXPECT_EQ((*specs)[0]["type"].toString(), juce::String("continuous"));
+  EXPECT_DOUBLE_EQ(static_cast<double>((*specs)[0]["min"]), 0.0);
+  EXPECT_DOUBLE_EQ(static_cast<double>((*specs)[0]["max"]), 10.0);
+
+  // Spec 1: a switch, carrying the option names the UI labels itself with.
+  EXPECT_EQ((*specs)[1]["name"].toString(), juce::String("mode"));
+  EXPECT_EQ((*specs)[1]["type"].toString(), juce::String("switch"));
+  const juce::var enumNamesVar = (*specs)[1]["enumNames"];
+  const auto* enumNames = enumNamesVar.getArray();
+  ASSERT_NE(enumNames, nullptr);
+  ASSERT_EQ(enumNames->size(), 3);
+  EXPECT_EQ((*enumNames)[0].toString(), juce::String("clean"));
+  EXPECT_EQ((*enumNames)[2].toString(), juce::String("lead"));
+
+  // Knob values, read through a helper: getArray() hands back a pointer into
+  // the var it is called on, so the chain of temporaries in
+  // firstToneBlock(proc)["params"]["namParamValues"] would dangle. Each var is
+  // held in a named local instead.
+  const auto knobValues = [](TONE3000Processor& p) {
+    const juce::var block = firstToneBlock(p);
+    const juce::var params = block["params"];
+    const juce::var values = params["namParamValues"];
+    std::vector<double> out;
+    if (const auto* array = values.getArray())
+      for (const auto& v : *array)
+        out.push_back(static_cast<double>(v));
+    return out;
+  };
+
+  // Values start at the model's own defaults.
+  const std::vector<double> initial = knobValues(proc);
+  ASSERT_EQ(initial.size(), 2u);
+  EXPECT_DOUBLE_EQ(initial[0], 5.0);
+
+  // A knob edit lands and reads back.
+  EXPECT_TRUE(proc.setBlockNamParam(blockId.toStdString(), 0, 8.25));
+  const std::vector<double> moved = knobValues(proc);
+  ASSERT_EQ(moved.size(), 2u);
+  EXPECT_NEAR(moved[0], 8.25, 1e-4);
+
+  // Out-of-range values clamp to the spec rather than being rejected, and a
+  // switch rounds to a whole index (native throws on a fractional one).
+  EXPECT_TRUE(proc.setBlockNamParam(blockId.toStdString(), 0, 99.0));
+  EXPECT_TRUE(proc.setBlockNamParam(blockId.toStdString(), 1, 1.6));
+  const std::vector<double> clamped = knobValues(proc);
+  ASSERT_EQ(clamped.size(), 2u);
+  EXPECT_DOUBLE_EQ(clamped[0], 10.0);
+  EXPECT_DOUBLE_EQ(clamped[1], 2.0);
+
+  // An index past the end is refused, not clamped: it would silently move
+  // the wrong knob.
+  EXPECT_FALSE(proc.setBlockNamParam(blockId.toStdString(), 7, 1.0));
+}
+
+TEST(LocalLoadTest, SnapshotNamExposesNoKnobs) {
+  TONE3000Processor proc;
+  const juce::var res =
+      proc.loadLocalTone("a2-amp-test", filesOf({testFileEntry("a2-amp-test.nam")}));
+  EXPECT_TRUE(res["error"].isVoid()) << res["error"].toString().toStdString();
+  ASSERT_TRUE(waitForChainLoaded(proc));
+
+  const juce::var block = firstToneBlock(proc);
+  EXPECT_TRUE(block["namParamSpecs"].isVoid());
+  EXPECT_TRUE(block["params"]["namParamValues"].isVoid());
+  EXPECT_FALSE(proc.setBlockNamParam(res["blockId"].toString().toStdString(), 0, 1.0));
+}
+
 TEST(LocalLoadTest, RejectsBadFilesAndSkipsThemInFolders) {
   TONE3000Processor proc;
 
@@ -147,7 +236,8 @@ TEST(LocalLoadTest, RejectsBadFilesAndSkipsThemInFolders) {
   const juce::String lstm = R"({"version":"0.5.4","architecture":"LSTM","config":{}})";
   const juce::String lstm64 = juce::Base64::toBase64(lstm.toRawUTF8(), lstm.getNumBytesAsUTF8());
   juce::var res = proc.loadLocalTone("model", filesOf({fileEntry("model.nam", lstm64)}));
-  EXPECT_EQ(res["error"].toString(), juce::String("Only A2 NAM files are supported"));
+  EXPECT_EQ(res["error"].toString(),
+            juce::String("Only A2 and parametric NAM files are supported"));
 
   res = proc.loadLocalTone("bad", filesOf({fileEntry("bad.wav", juce::Base64::toBase64("x", 1))}));
   EXPECT_EQ(res["error"].toString(), juce::String("Not a valid WAV file"));

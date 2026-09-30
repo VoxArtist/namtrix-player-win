@@ -355,6 +355,19 @@ juce::WebBrowserComponent::Options buildMainWebViewOptions(TONE3000Editor* edito
                 args[0].toString().toStdString(), coerceDouble(args[1])));
           }))
       .withNativeFunction(
+          // (blockId, knobIndex, value): one knob of a parametric NAM model
+          // (ConcatWaveNet / HyperWaveNet / ConcatLSTM), indexed into the
+          // spec list the block ships as `namParamSpecs`. Single-knob so a
+          // drag coalesces into one undo step, like setBlockParam's
+          // continuous params. Returns false for snapshot models, an
+          // unloaded engine, or an out-of-range index; the value is clamped
+          // (and rounded, for switch params) natively.
+          "setBlockNamParam", guarded(3, false, [editor](const juce::Array<juce::var>& args) {
+            return juce::var(editor->processor.setBlockNamParam(
+                args[0].toString().toStdString(), static_cast<int>(args[1]),
+                coerceDouble(args[2])));
+          }))
+      .withNativeFunction(
           // (blockId, bandIndex, { type, freqHz, gainDb, q }). Whole-band
           // updates keep drags atomic and give undo/redo a clean unit later.
           "setBlockEqBand", guarded(3, false, [editor](const juce::Array<juce::var>& args) {

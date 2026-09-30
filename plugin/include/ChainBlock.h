@@ -208,6 +208,17 @@ struct ChainBlock {
   // the loaded engine in place.
   double namSlimSize{0.0};
 
+  // Parametric (knob-conditioned) NAM models only: the user's knob positions,
+  // one float per nam::ParamSpec, in the model's positional order. Empty for
+  // snapshot models and for a parametric block whose engine hasn't loaded yet.
+  //
+  // Persisted with the chain so a preset/session restores the knobs, and
+  // re-applied to the engine on load (the engine otherwise starts at the
+  // model's own defaults). Size is validated against the loaded model's spec
+  // count before being applied: a preset saved against a different model, or
+  // an edited state tree, must not push a wrong-length vector into SetParams.
+  std::vector<float> namParamValues;
+
   // Per-block controls (normalized 0..1)
   float inputGainNormalized{0.5f};  // 0.5 = unity gain; drives the block harder/softer
   juce::LinearSmoothedValue<float> inputGainSmoother;

@@ -128,6 +128,18 @@ juce::ValueTree TONE3000Processor::serializeBlockSettings(const ChainBlock& bloc
   blockState.setProperty("enabled", block.enabled, nullptr);
   blockState.setProperty("normalize", block.normalizeEnabled, nullptr);
   blockState.setProperty("slimSize", block.namSlimSize, nullptr);
+
+  // Parametric knob positions, comma-joined. A plain string rather than a var
+  // array because this tree travels two serializers (session state via
+  // writeToStream, and the preset files) and a string survives both
+  // identically. Absent for snapshot models, which restore as "no values" and
+  // so leave the model's own defaults alone.
+  if (!block.namParamValues.empty()) {
+    juce::StringArray joined;
+    for (const float value : block.namParamValues)
+      joined.add(juce::String(value, 6));
+    blockState.setProperty("namParams", joined.joinIntoString(","), nullptr);
+  }
   blockState.setProperty("inputGain", block.inputGainNormalized, nullptr);
   blockState.setProperty("outputGain", block.outputGainNormalized, nullptr);
   blockState.setProperty("mix", block.mixNormalized, nullptr);
@@ -157,6 +169,27 @@ void TONE3000Processor::applyBlockSettings(ChainBlock& block, const juce::ValueT
       juce::jlimit(0.0, 1.0, static_cast<double>(blockState.getProperty("slimSize", 0.0)));
   if (block.namEngine != nullptr)
     block.namEngine->setSlimmableSize(block.namSlimSize);
+
+  // Knob positions. Parsed unconditionally, but only pushed at an engine that
+  // is both loaded and parametric with a matching spec count -- a preset saved
+  // against a different model must leave the loaded one on its own defaults
+  // rather than force a wrong-length vector at it. The stored vector is kept
+  // either way, so a later load of the matching model still restores it
+  // (queueActiveModelLoad reads block.namParamValues on the way through).
+  {
+    const juce::String packed = blockState.getProperty("namParams", juce::String()).toString();
+    block.namParamValues.clear();
+    if (packed.isNotEmpty()) {
+      for (const auto& token : juce::StringArray::fromTokens(packed, ",", ""))
+        block.namParamValues.push_back(token.getFloatValue());
+    }
+    if (block.namEngine != nullptr && block.namEngine->isParametric() &&
+        !block.namParamValues.empty()) {
+      if (!block.namEngine->setParamValues(block.namParamValues))
+        juce::Logger::writeToLog("[State] Stored knob values don't fit the loaded model; "
+                                 "keeping its defaults");
+    }
+  }
 
   if (block.type != ChainBlockType::INSERT) {
     // A missing Eq child restores as flat. Block EQs always run in the chain

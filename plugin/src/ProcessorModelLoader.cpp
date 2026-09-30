@@ -97,6 +97,23 @@ bool namConfigIsA2(const nlohmann::json& modelJson) {
   return false;
 }
 
+// Parametric (knob-conditioned) architectures from the NeuralAmpModelerCore
+// parametric fork. These are not A2-shaped -- their conditioning path is a
+// FiLM/concat stage the A2 fast path doesn't model -- so they fail
+// namConfigIsA2 and need admitting on their own terms.
+//
+// Deliberately NOT added to namConfigIsPhaseSafe: phase interleaving is exact
+// only for pure dilated convolution, and neither the concat conditioner (which
+// carries its own ramp state across a block) nor HyperWaveNet (which
+// regenerates weights per parameter change) is that. They fall through to the
+// single-instance, time-scaled path, which is the same defensive route LSTM
+// takes -- correct, just without the oversampling win.
+bool namConfigIsParametric(const nlohmann::json& modelJson) {
+  const std::string architecture = modelJson.value("architecture", "");
+  return architecture == "ConcatWaveNet" || architecture == "HyperWaveNet" ||
+         architecture == "ConcatLSTM";
+}
+
 // Stash folder for drop-loaded local models. The block's toneJson persists
 // the stash path as its model_url, so a cache-lost reload (undo after
 // remove, undo across a tone swap) re-reads this copy even after the user's
@@ -104,13 +121,7 @@ bool namConfigIsA2(const nlohmann::json& modelJson) {
 // file; stale entries age out (see cleanLocalModelStash). Same app-data
 // root as PresetManager. Persisted URLs are resolved back to this folder by
 // resolveLocalModelFile, which is what survives the iOS container rotating.
-juce::File localModelsDir() {
-  juce::File base = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory);
-#if JUCE_MAC
-  base = base.getChildFile("Application Support");
-#endif
-  return base.getChildFile("TONE3000").getChildFile("LocalModels");
-}
+juce::File localModelsDir() { return TONE3000Processor::localModelStashDir(); }
 
 // FNV-1a over the file bytes: stable across sessions and platforms without
 // pulling in juce_cryptography. The size suffix in the stash name backs up
@@ -174,8 +185,8 @@ juce::var stashLocalBytes(const juce::String& filename, juce::MemoryOutputStream
     try {
       const auto* bytes = static_cast<const char*>(decoded.getData());
       const nlohmann::json config = nlohmann::json::parse(bytes, bytes + decoded.getDataSize());
-      if (!namConfigIsA2(config))
-        return fail("Only A2 NAM files are supported");
+      if (!namConfigIsA2(config) && !namConfigIsParametric(config))
+        return fail("Only A2 and parametric NAM files are supported");
     } catch (const std::exception&) {
       return fail("Not a valid NAM file");
     }
@@ -218,6 +229,63 @@ juce::var stashLocalBytes(const juce::String& filename, juce::MemoryOutputStream
   model->setProperty("name", filename.upToLastOccurrenceOf(".", false, false));
   model->setProperty("model_url", juce::URL(stash).toString(false));
   return juce::var(model.get());
+}
+
+// Cover art for a local model: an image file sitting beside it with the same
+// base name ("plexi.nam" + "plexi.png"). Copied into the same content-addressed
+// stash as the models so the artwork survives the original folder moving, and
+// so it ages out with the same GC.
+//
+// Only reachable for path-based loads (the Load File / Load Folder pickers). A
+// drag-and-drop hands the webview file *bytes* with no directory, so there is
+// nothing to look beside -- see loadLocalTone.
+//
+// Returns the URL the webview should request (served by
+// TONE3000Editor::getResource), or an empty string when there is no sibling.
+juce::String stashSiblingImage(const juce::File& modelFile) {
+  // Order is the preference order when several siblings exist.
+  static const char* kImageExtensions[] = {".png", ".jpg", ".jpeg", ".webp", ".gif"};
+  // Cover art is decoration: skip anything big rather than copying a 40 MB TIFF
+  // into the stash and pushing it through the webview on every block render.
+  static constexpr juce::int64 kMaxImageBytes = 8 * 1024 * 1024;
+
+  const juce::File directory = modelFile.getParentDirectory();
+  const juce::String stem = modelFile.getFileNameWithoutExtension();
+
+  for (const char* extension : kImageExtensions) {
+    const juce::File candidate = directory.getChildFile(stem + extension);
+    if (!candidate.existsAsFile() || candidate.getSize() <= 0)
+      continue;
+    if (candidate.getSize() > kMaxImageBytes) {
+      juce::Logger::writeToLog("[LocalLoad] Cover art too large, ignoring: " +
+                               candidate.getFileName());
+      continue;
+    }
+
+    juce::MemoryBlock bytes;
+    if (!candidate.loadFileAsData(bytes) || bytes.getSize() == 0)
+      continue;
+
+    const juce::uint64 hash = fnv1a64(bytes.getData(), bytes.getSize());
+    const juce::String stashName = juce::String::toHexString(static_cast<juce::int64>(hash)) + "-" +
+                                   juce::String(static_cast<juce::int64>(bytes.getSize())) +
+                                   juce::String(extension);
+    const juce::File stash = localModelsDir().getChildFile(stashName);
+    if (!stash.existsAsFile()) {
+      stash.getParentDirectory().createDirectory();
+      if (!stash.replaceWithData(bytes.getData(), bytes.getSize()))
+        continue;
+    } else {
+      // Same bytes already stashed: refresh the GC liveness stamp.
+      stash.setLastModificationTime(juce::Time::getCurrentTime());
+    }
+
+    juce::Logger::writeToLog("[LocalLoad] Cover art: " + candidate.getFileName());
+    // Root-relative, so the webview resolves it against its own origin; a
+    // file:// URL would be blocked as cross-origin.
+    return "/" + stashName;
+  }
+  return {};
 }
 
 // A dropped file as shipped by the webview: { name, data } with base64
@@ -414,7 +482,8 @@ juce::var TONE3000Processor::loadLocalTonePath(const juce::File& source,
       models.add(model);
     }
 
-    return finishLocalToneLoad(title, models, firstError, picked.size(), targetInsertId);
+    return finishLocalToneLoad(title, models, firstError, picked.size(), targetInsertId,
+                               stashSiblingImage(picked.getReference(0)));
   }
 
   const juce::String title = source.getFileNameWithoutExtension();
@@ -429,7 +498,7 @@ juce::var TONE3000Processor::loadLocalTonePath(const juce::File& source,
   if (!model.isObject())
     return localToneError(title, error);
 
-  return finishLocalToneLoad(title, {model}, {}, 1, targetInsertId);
+  return finishLocalToneLoad(title, {model}, {}, 1, targetInsertId, stashSiblingImage(source));
 }
 
 juce::var TONE3000Processor::loadLocalToneUrls(const juce::Array<juce::URL>& sources,
@@ -483,7 +552,8 @@ juce::var TONE3000Processor::loadLocalToneUrls(const juce::Array<juce::URL>& sou
 juce::var TONE3000Processor::finishLocalToneLoad(const juce::String& title,
                                                  const juce::Array<juce::var>& stashedModels,
                                                  const juce::String& firstError, int fileCount,
-                                                 const std::string& targetInsertId) {
+                                                 const std::string& targetInsertId,
+                                                 const juce::String& imageUrl) {
   // Identical bytes under two names would collide on the content-derived
   // id (cache key, picker selection); the first name wins.
   juce::Array<juce::var> models;
@@ -509,6 +579,10 @@ juce::var TONE3000Processor::finishLocalToneLoad(const juce::String& title,
   tone->setProperty("title", title);
   tone->setProperty("format", isNam ? "nam" : "ir");
   tone->setProperty("models", models);
+  // Cover art found beside the file, if any. Same shape as a catalog tone's
+  // images array, so the UI renders it through the existing path.
+  if (imageUrl.isNotEmpty())
+    tone->setProperty("images", juce::Array<juce::var>{juce::var(imageUrl)});
 
   const juce::String toneJson = juce::JSON::toString(juce::var(tone.get()));
 
@@ -593,6 +667,14 @@ juce::String TONE3000Processor::localFileNameFromUrl(const juce::URL& url) {
   if (url.isLocalFile())
     return url.getLocalFile().getFileName();
   return juce::URL::removeEscapeChars(url.getFileName());
+}
+
+juce::File TONE3000Processor::localModelStashDir() {
+  juce::File base = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory);
+#if JUCE_MAC
+  base = base.getChildFile("Application Support");
+#endif
+  return base.getChildFile("TONE3000").getChildFile("LocalModels");
 }
 
 juce::File TONE3000Processor::resolveLocalModelFile(const juce::File& stashRoot,
@@ -755,7 +837,8 @@ TONE3000Processor::PreparedBlockModel TONE3000Processor::prepareBlockModelOffThr
     ChainBlockType type,
     const std::vector<uint8_t>& modelData,
     const juce::String& filename,
-    double namSlimSize) {
+    double namSlimSize,
+    const std::vector<float>& namParamValues) {
   PreparedBlockModel out;
 
   if (modelData.empty()) {
@@ -827,6 +910,23 @@ TONE3000Processor::PreparedBlockModel TONE3000Processor::prepareBlockModelOffThr
       // The block's A2 size (no-op for non-slimmable models); prepare()
       // applies it.
       engine->setSlimmableSize(namSlimSize);
+
+      // Restored knob positions go on BEFORE prepare(): prepare() resets the
+      // model, and IParametricControl specifies that a reset settles on the
+      // committed vector instead of ramping into it. Committing after would
+      // make every session restore audibly glide from the model's defaults to
+      // the user's saved knobs. A length mismatch (preset saved against a
+      // different model) is rejected by setParamValues, leaving the model's
+      // own defaults -- the right fallback, and better than a wrong tone.
+      if (!namParamValues.empty() && engine->isParametric()) {
+        if (!engine->setParamValues(namParamValues)) {
+          juce::Logger::writeToLog(
+              "[ModelLoader] Stored knob values don't fit this model (" +
+              juce::String(namParamValues.size()) + " vs " +
+              juce::String(engine->getParamSpecs().size()) + "); using model defaults");
+        }
+      }
+
       engine->prepare(domainBlockSize);
 
       out.namEngine = std::move(engine);
@@ -1231,6 +1331,17 @@ void TONE3000Processor::applyPreparedModelToChainBlock(ChainBlock& block, ChainB
     // Re-assert the block's A2 size in case it changed while this engine
     // was downloading/preparing (a no-op retier when it didn't).
     block.namEngine->setSlimmableSize(block.namSlimSize);
+
+    // Same for the knobs: the user can turn them while a swap is in flight.
+    // This runs post-reset so it ramps rather than settles, which is right --
+    // it is a live edit, not a restore. Sync the block's copy either way, so
+    // a snapshot model clears stale values and a parametric one records the
+    // defaults it actually started from.
+    if (block.namEngine->isParametric() && !block.namParamValues.empty())
+      block.namEngine->setParamValues(block.namParamValues);
+    block.namParamValues = block.namEngine->isParametric()
+                               ? block.namEngine->getParamValues()
+                               : std::vector<float>{};
 
     block.namNormalizationSmoother.reset(chainSampleRate(), 0.05f);
     block.namNormalizationSmoother.setCurrentAndTargetValue(1.0f);

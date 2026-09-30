@@ -140,6 +140,11 @@ public:
   // longer exists, the same name under the current root is the same bytes.
   // A stored path that does exist is returned untouched, which is every
   // desktop case (the root never moves there). Empty File for a non-file URL.
+  /** Root of the content-addressed stash holding locally loaded models and
+      their cover art. Public so the editor's webview resource provider can
+      serve stashed images by name (see TONE3000Editor::getResource). */
+  static juce::File localModelStashDir();
+
   static juce::File resolveLocalModelFile(const juce::File& stashRoot,
                                           const juce::String& modelUrl);
   // The file name a URL names, percent-decoded. juce::URL::getFileName returns
@@ -238,6 +243,17 @@ public:
   // thread off the lock while the fade holds). Undoable; no-op sets never
   // dip the audio.
   bool setBlockSlimSize(const std::string& blockId, double slimSize);
+
+  /**
+   * Set one knob of a parametric NAM block, by its index into the model's
+   * spec list. Returns false for a snapshot model, an unloaded engine, or an
+   * out-of-range index.
+   *
+   * Single-knob rather than whole-vector so a drag coalesces into one undo
+   * step per knob, matching setBlockParam's continuous params. The value is
+   * clamped (and rounded, for switches) by NamEngine::setParamValues.
+   */
+  bool setBlockNamParam(const std::string& blockId, int index, double value);
 
   // Default NAM A2 size for newly added blocks (machine-wide user setting,
   // like multi-core), in the same slimmable-size domain. Existing blocks
@@ -468,7 +484,8 @@ private:
   juce::var finishLocalToneLoad(const juce::String& title,
                                 const juce::Array<juce::var>& stashedModels,
                                 const juce::String& firstError, int fileCount,
-                                const std::string& targetInsertId);
+                                const std::string& targetInsertId,
+                                const juce::String& imageUrl = {});
 
   /** Largest frame count the chain stage can see per boundary callback at the
       base rate: the host max block size converted to 48 kHz frames (and never
@@ -513,7 +530,8 @@ private:
       tier selection and prewarm run out here instead of under the apply
       lock). */
   PreparedBlockModel prepareBlockModelOffThread(ChainBlockType type, const std::vector<uint8_t>& modelData,
-                                                const juce::String& filename, double namSlimSize);
+                                                const juce::String& filename, double namSlimSize,
+                                                const std::vector<float>& namParamValues = {});
   /** Short path under `chainMutex` only: swaps the new engines onto `block`
       and stamps `newType` (a tone swap may change the block's type; the old
       engine kept processing under the old type until this moment). The

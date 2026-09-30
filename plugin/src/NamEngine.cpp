@@ -16,6 +16,26 @@ NamEngine::NamEngine(std::vector<std::unique_ptr<nam::DSP>> phaseInstances, int 
   if (factor < 1 || (count != 1 && count != factor))
     throw std::invalid_argument("NamEngine instance count must be 1 or the oversampling factor");
 
+  // Resolve the parametric interface once: dynamic_cast allocates nothing but
+  // walks the RTTI graph, which is not something to do per audio block. Every
+  // phase is the same architecture, so either all of them are parametric or
+  // none are; a partial result would leave phases out of lockstep, so treat it
+  // as non-parametric rather than driving only some of them.
+  {
+    std::vector<nam::IParametricControl*> controls;
+    controls.reserve(instances.size());
+    for (const auto& instance : instances) {
+      if (auto* pc = dynamic_cast<nam::IParametricControl*>(instance.get()))
+        controls.push_back(pc);
+    }
+    if (controls.size() == instances.size() && !controls.empty()) {
+      paramControls = std::move(controls);
+      paramSpecs = paramControls.front()->GetParamSpecs();
+      const auto committed = paramControls.front()->GetParams();
+      paramValues.assign(committed.begin(), committed.end());
+    }
+  }
+
   // Informational only; the chain domain runs the model at the chain rate
   // regardless (the loader logs a warning on mismatch).
   try {
@@ -59,6 +79,41 @@ void NamEngine::setSlimmableSize(double val) {
     if (auto* slimmable = dynamic_cast<nam::SlimmableModel*>(instance.get()))
       slimmable->SetSlimmableSize(requestedSlimmableSize);
   }
+}
+
+bool NamEngine::setParamValues(const std::vector<float>& values) {
+  if (paramControls.empty())
+    return false;
+  if (values.size() != paramSpecs.size())
+    return false;
+
+  // Clamp to each spec's range, and round switches: the conditioner rejects a
+  // non-integral or out-of-range switch index by throwing, and this runs from
+  // the message thread where a throw would take down the editor. A UI slider
+  // landing on 1.9999 is the expected case, not a defensive one.
+  std::vector<float> sanitized(values.size());
+  for (size_t i = 0; i < values.size(); ++i) {
+    const auto& spec = paramSpecs[i];
+    float v = juce::jlimit(spec.min, spec.max, values[i]);
+    if (spec.type == "switch") {
+      v = std::round(v);
+      // num_inputs() is the enum width; the highest valid index is one below.
+      v = juce::jlimit(0.0f, static_cast<float>(spec.num_inputs() - 1), v);
+    }
+    sanitized[i] = v;
+  }
+
+  for (auto* control : paramControls) {
+    try {
+      control->SetParams(sanitized);
+    } catch (const std::exception& e) {
+      juce::Logger::writeToLog(juce::String("NamEngine::setParamValues rejected: ") + e.what());
+      return false;
+    }
+  }
+
+  paramValues = std::move(sanitized);
+  return true;
 }
 
 void NamEngine::process(juce::AudioBuffer<float>& buffer, RtWorkerPool* pool) {

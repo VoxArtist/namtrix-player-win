@@ -798,6 +798,11 @@ void TONE3000Processor::loadToneInBackground(const std::string& blockId, int fir
       modelName + (type == ChainBlockType::NAM ? ".nam" : ".wav");
 
   double namSlimSize = 0.0;
+  // Carried into the prepare so restored knobs settle rather than glide.
+  // A model switch may land on a model with a different knob layout; the
+  // length check in setParamValues rejects it and the new model keeps its
+  // own defaults.
+  std::vector<float> namParamValues;
   {
     juce::ScopedLock lock(chainMutex);
     ChainBlock* block = findBlockById(blockId);
@@ -809,9 +814,11 @@ void TONE3000Processor::loadToneInBackground(const std::string& blockId, int fir
 
     block->modelCache[firstModelId] = modelData;
     namSlimSize = block->namSlimSize;
+    namParamValues = block->namParamValues;
   }
 
-  PreparedBlockModel prepared = prepareBlockModelOffThread(type, modelData, filename, namSlimSize);
+  PreparedBlockModel prepared =
+      prepareBlockModelOffThread(type, modelData, filename, namSlimSize, namParamValues);
   const bool applied = prepared.success;
 
   // A swapped tone's previous engine may still be audibly processing; let
@@ -857,6 +864,11 @@ void TONE3000Processor::switchModelInBackground(const std::string& blockId, int 
   bool needsFetch = false;
   ChainBlockType blockTypeForPrepare = ChainBlockType::NAM;
   double namSlimSize = 0.0;
+  // Carried into the prepare so restored knobs settle rather than glide.
+  // A model switch may land on a model with a different knob layout; the
+  // length check in setParamValues rejects it and the new model keeps its
+  // own defaults.
+  std::vector<float> namParamValues;
 
   {
     juce::ScopedLock lock(chainMutex);
@@ -878,6 +890,7 @@ void TONE3000Processor::switchModelInBackground(const std::string& blockId, int 
     // still processing) while this job builds the new tone's engine.
     blockTypeForPrepare = toneEngineType(block->toneVar, block->type);
     namSlimSize = block->namSlimSize;
+    namParamValues = block->namParamValues;
     auto cacheIt = block->modelCache.find(modelId);
 
     if (cacheIt != block->modelCache.end()) {
@@ -907,7 +920,8 @@ void TONE3000Processor::switchModelInBackground(const std::string& blockId, int 
       modelName + (blockTypeForPrepare == ChainBlockType::NAM ? ".nam" : ".wav");
 
   PreparedBlockModel prepared =
-      prepareBlockModelOffThread(blockTypeForPrepare, modelData, filename, namSlimSize);
+      prepareBlockModelOffThread(blockTypeForPrepare, modelData, filename, namSlimSize,
+                                 namParamValues);
   const bool applied = prepared.success;
 
   // The outgoing model keeps processing until this moment; fade it out on
@@ -979,6 +993,10 @@ juce::var TONE3000Processor::getChainState(int knownRevision) const {
     double inputDbu = 0.0, outputDbu = 0.0;
     bool enabled = true, normalize = true;
     double slimSize = 0.0;
+    // Parametric NAM: knob specs (model metadata) and the user's current
+    // positions. Both stay void for snapshot models, which is what the UI
+    // keys off to decide whether to render a knob row at all.
+    juce::var namParamSpecs, namParamValues;
     float inputGain = 0.5f, outputGain = 0.5f, mix = 1.0f;
     juce::var eq;
     bool rtFailed = false;
@@ -1039,6 +1057,34 @@ juce::var TONE3000Processor::getChainState(int knownRevision) const {
               std::isfinite(block->namEngine->getOutputLevel())) {
             row.hasOutputDbu = true;
             row.outputDbu = block->namEngine->getOutputLevel();
+          }
+
+          if (block->namEngine->isParametric()) {
+            juce::Array<juce::var> specs, values;
+            const auto& blockSpecs = block->namEngine->getParamSpecs();
+            const auto& blockValues = block->namEngine->getParamValues();
+            for (size_t i = 0; i < blockSpecs.size(); ++i) {
+              const auto& spec = blockSpecs[i];
+              juce::DynamicObject::Ptr entry = new juce::DynamicObject();
+              entry->setProperty("name", juce::String(spec.name));
+              entry->setProperty("min", spec.min);
+              entry->setProperty("max", spec.max);
+              entry->setProperty("default", spec.defaultValue);
+              entry->setProperty("type", juce::String(spec.type));
+              if (spec.type == "switch") {
+                juce::Array<juce::var> names;
+                for (const auto& name : spec.enum_names)
+                  names.add(juce::String(name));
+                entry->setProperty("enumNames", names);
+              }
+              specs.add(juce::var(entry.get()));
+              // getParamValues() is kept in step with the specs by the engine,
+              // but read defensively: a short vector here would desync the
+              // UI's knob indices from the model's.
+              values.add(i < blockValues.size() ? blockValues[i] : spec.defaultValue);
+            }
+            row.namParamSpecs = specs;
+            row.namParamValues = values;
           }
         }
         row.enabled = block->enabled;
@@ -1112,6 +1158,10 @@ juce::var TONE3000Processor::getChainState(int knownRevision) const {
       // Long (reverb-like) IR: drives the UI's Mix knob default/Alt-click
       // reset and the Out knob help (long IRs carry no -18 dB pad).
       item->setProperty("irLong", row.irLong);
+      // Knob specs ride on the item (model metadata, not user-editable);
+      // the positions go in `params` with the rest of the persisted state.
+      if (!row.namParamSpecs.isVoid())
+        item->setProperty("namParamSpecs", row.namParamSpecs);
 
       if (row.hasInputDbu)
         item->setProperty("inputLevelDbu", row.inputDbu);
@@ -1122,6 +1172,8 @@ juce::var TONE3000Processor::getChainState(int knownRevision) const {
       params->setProperty("enabled", row.enabled);
       params->setProperty("normalize", row.normalize);
       params->setProperty("slimSize", row.slimSize);
+      if (!row.namParamValues.isVoid())
+        params->setProperty("namParamValues", row.namParamValues);
       params->setProperty("inputGain", row.inputGain);
       params->setProperty("outputGain", row.outputGain);
       params->setProperty("mix", row.mix);
@@ -1502,6 +1554,51 @@ bool TONE3000Processor::setBlockParam(const std::string& blockId, const juce::St
     deferredRevisionBump();
   else
     bumpChainRevision();
+  return true;
+}
+
+bool TONE3000Processor::setBlockNamParam(const std::string& blockId, int index, double value) {
+  // chainMutex is the serialization the IParametricControl contract demands
+  // between SetParams() and process(): the audio thread either holds this lock
+  // while running the chain stage or blocks on it (see processBlock's
+  // try-lock), so the two can never overlap. The hold is short and
+  // allocation-free -- SetParams pre-sizes its storage at construction -- so
+  // unlike setBlockSlimSize this needs no mute-splice; the conditioner ramps
+  // the new target internally. (HyperWaveNet is documented as NOT smoothing:
+  // its knobs reach the audio only through regenerated weights, so they step.
+  // That is the model's behavior, not something the host can smooth over.)
+  juce::ScopedLock lock(chainMutex);
+
+  ChainBlock* block = findBlockById(blockId);
+  if (block == nullptr || block->type != ChainBlockType::NAM)
+    return false;
+  if (block->namEngine == nullptr || !block->namEngine->isParametric())
+    return false;
+
+  const auto& specs = block->namEngine->getParamSpecs();
+  if (index < 0 || static_cast<size_t>(index) >= specs.size()) {
+    DBG("setBlockNamParam: index out of range: " << index);
+    return false;
+  }
+
+  std::vector<float> values = block->namEngine->getParamValues();
+  if (values.size() != specs.size())
+    values.assign(specs.size(), 0.0f);
+  values[static_cast<size_t>(index)] = static_cast<float>(value);
+
+  // Record history only once the call is known to be valid, so a rejected
+  // set never leaves an undo entry (same rule as setBlockParam).
+  pushChainHistory("namParam:" + juce::String(blockId) + ":" + juce::String(index));
+
+  if (!block->namEngine->setParamValues(values))
+    return false;
+
+  // Mirror the engine's sanitized values, not the raw request: the persisted
+  // state should match what the model actually committed.
+  block->namParamValues = block->namEngine->getParamValues();
+
+  // Knob drags settle into one bump after the gesture, like the gain knobs.
+  deferredRevisionBump();
   return true;
 }
 

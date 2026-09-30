@@ -4,6 +4,7 @@
 #include <memory>
 #include <vector>
 #include "NAM/dsp.h"
+#include "NAM/parametric_control.h"
 #include "ChainDomain.h"
 
 /**
@@ -94,6 +95,38 @@ public:
   double getLoudness() const { return primary().GetLoudness(); }
 
   /**
+   * Parametric (knob-conditioned) models: ConcatWaveNet, HyperWaveNet and
+   * ConcatLSTM expose runtime knobs through nam::IParametricControl, which
+   * the loader's snapshot architectures do not implement. Snapshot models
+   * report isParametric() == false and every setter below is a no-op, so
+   * callers need no type test of their own.
+   *
+   * The value vector is one float per spec (nam::IParametricControl::ParamDim()
+   * == GetParamSpecs().size()); the one-hot expansion of "switch" params is
+   * internal to the model. Switch values MUST be integer indices in
+   * [0, enum_names.size() - 1] or SetParams throws std::invalid_argument, so
+   * setParamValues rounds and clamps every incoming value to its spec before
+   * handing it over.
+   */
+  bool isParametric() const { return !paramControls.empty(); }
+
+  /** Per-knob specs in positional order; empty for snapshot models. */
+  const std::vector<nam::ParamSpec>& getParamSpecs() const { return paramSpecs; }
+
+  /** The last values committed by setParamValues (spec defaults until then). */
+  const std::vector<float>& getParamValues() const { return paramValues; }
+
+  /**
+   * Commit knob values, clamped (and rounded, for switches) to each spec.
+   * Fans out to every phase instance, exactly like setSlimmableSize: the
+   * phases are independent copies of one model and must stay in lockstep or
+   * they decode different tones into alternating samples.
+   * A vector whose size != getParamSpecs().size() is rejected and returns
+   * false, leaving the committed values untouched.
+   */
+  bool setParamValues(const std::vector<float>& values);
+
+  /**
    * Requested slimmable size (0.0 = lite, 1.0 = full). Clamped to [0.0, 1.0].
    * A no-op for models that aren't SlimmableModel (non-container A2 files).
    * NAM tier mappers assign the boundary value to the tier above (a two-tier
@@ -118,6 +151,14 @@ private:
   }
 
   std::vector<std::unique_ptr<nam::DSP>> instances;
+
+  // Non-owning views of `instances` that implement IParametricControl,
+  // resolved once in the constructor (dynamic_cast is not RT-safe). Empty
+  // for snapshot models, and parallel to `instances` when non-empty.
+  std::vector<nam::IParametricControl*> paramControls;
+  std::vector<nam::ParamSpec> paramSpecs;
+  std::vector<float> paramValues;
+
   int oversampleFactor = 1;
   double modelSampleRate;
 

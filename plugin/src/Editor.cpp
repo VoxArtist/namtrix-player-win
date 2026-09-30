@@ -409,6 +409,31 @@ std::optional<juce::WebBrowserComponent::Resource> TONE3000Editor::getResource(
   const char* data = BinaryData::getNamedResource(resourceName.toRawUTF8(), size);
 
   if (data == nullptr || size <= 0) {
+    // Not an embedded asset. Cover art for locally loaded models lives in the
+    // stash instead, requested by its content-addressed file name (see
+    // stashSiblingImage). Serve it from there.
+    //
+    // Deliberately narrow: the name is taken as a leaf (juce::URL::getFileName
+    // drops any path), it must already exist in the stash folder, and it must
+    // have an image extension -- so this cannot be walked outward to read
+    // arbitrary files off disk.
+    const juce::String stashExt = filename.fromLastOccurrenceOf(".", false, false).toLowerCase();
+    const bool isImage = stashExt == "png" || stashExt == "jpg" || stashExt == "jpeg" ||
+                         stashExt == "webp" || stashExt == "gif";
+    if (isImage && filename.isNotEmpty()) {
+      const juce::File stashed =
+          TONE3000Processor::localModelStashDir().getChildFile(filename);
+      juce::MemoryBlock bytes;
+      if (stashed.existsAsFile() && stashed.loadFileAsData(bytes) && bytes.getSize() > 0) {
+        std::vector<std::byte> stashContent(bytes.getSize());
+        std::memcpy(stashContent.data(), bytes.getData(), bytes.getSize());
+        juce::String stashMime = getMimeForExtension(stashExt);
+        if (stashMime.isEmpty())
+          stashMime = "application/octet-stream";
+        return juce::WebBrowserComponent::Resource{std::move(stashContent), stashMime};
+      }
+    }
+
     juce::Logger::writeToLog("Resource not found or empty: " + resourceName);
     return std::nullopt;
   }
