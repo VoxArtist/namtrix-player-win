@@ -21,9 +21,8 @@ endif()
 set(PLUGIN_NAME "NAMTRIX Player")      # Name of the plugin (used in the UI)
 set(PLUGIN_CODE Nmxp)                # Unique 4-letter code for the plugin
 
-# Version comes from the repo-root VERSION file (single source of truth;
-# bump with script/set-version.sh). Read here too so this directory still
-# configures standalone.
+# Version comes from the repo-root VERSION file (single source of truth).
+# Read here too so this directory still configures standalone.
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../VERSION" T3K_VERSION)
 string(STRIP "${T3K_VERSION}" T3K_VERSION)
 # Only when configured standalone. As a subdirectory the root CMakeLists
@@ -37,6 +36,10 @@ endif()
 project(TONE3000 VERSION ${T3K_VERSION})   # Set version of the plugin
 
 option(HEADLESS "Disable GUI (headless/embedded build)" OFF)
+# The UI's testbed app (plugin/ui/testbed: scenario captures, pixel compare,
+# --selftest, --bench) as part of this build; registers its self-tests with
+# ctest. Also configurable on its own: cmake -S plugin/ui/testbed -B build-ui.
+option(T3K_BUILD_UI_TESTBED "Build the UI testbed (UiTestbed) and register its self-tests" OFF)
 option(BUILD_AAX "Build AAX (Avid) format" ON)
 option(BUILD_LV2 "Build LV2 format (native Linux plugin standard)" ON)
 option(BUILD_CLAP "Build CLAP format (via clap-juce-extensions)" ON)
@@ -55,8 +58,6 @@ endif()
 
 # Build for Desktop or Embedded
 if (NOT HEADLESS)
-    set(JUCE_WEB_BROWSER_VALUE 1)               # Webview UI for Desktop
-    set(NEEDS_WEB_BROWSER_VALUE TRUE)           # enable, need browser for webview on linux
     list(APPEND _plugin_formats "Standalone")   # Add Standalone format
     # Enable AU (Apple) format on macOS
     if (APPLE AND NOT T3K_IOS)
@@ -70,14 +71,7 @@ if (NOT HEADLESS)
     endif()
     set(VST3_MANIFEST TRUE)                     # Create moduleinfo.json for VST3
     add_compile_definitions(HEADLESS=0)
-    if (WIN32)
-        set(NEEDS_WEBVIEW2_VALUE TRUE)
-    else()
-        set(NEEDS_WEBVIEW2_VALUE FALSE)
-    endif()
 else()
-    set(JUCE_WEB_BROWSER_VALUE 0)               # No Webview UI for Embedded
-    set(NEEDS_WEB_BROWSER_VALUE FALSE)          # disable, need browser for webview on linux
     find_package(JUCE CONFIG REQUIRED)          # maybe remove?
     set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF) # Disable LTO
     set(VST3_MANIFEST FALSE)                    # Maybe remove?
@@ -186,8 +180,12 @@ endif()
 #   story on iOS is the Files app. These two put the app's Documents folder in
 #   Files (UIFileSharingEnabled + LSSupportsOpeningDocumentsInPlace) so a user
 #   can drop captures in, and let juce::FileChooser open them in place.
+# - TARGETED_DEVICE_FAMILY: "2" is iPad only. JUCE defaults to "1,2"
+#   (iPhone + iPad), and App Store Connect reads the family from the binary,
+#   so with the default it demands iPhone screenshots before review and would
+#   let the app install on iPhones the layout was never sized for.
 # - IPAD_SCREEN_ORIENTATIONS: the faceplate is landscape by design. iPhone is
-#   out of scope for this PR, so no iPhone orientation list.
+#   out of scope, so no iPhone orientation list.
 # - REQUIRES_FULL_SCREEN: App Store validation refuses a landscape-only iPad
 #   app unless it opts out of multitasking with UIRequiresFullScreen
 #   (ITMS-90474). On iPadOS 26 the key no longer blocks windowing at runtime,
@@ -211,6 +209,7 @@ if (T3K_IOS)
         BACKGROUND_AUDIO_ENABLED TRUE
         FILE_SHARING_ENABLED TRUE
         DOCUMENT_BROWSER_ENABLED TRUE
+        TARGETED_DEVICE_FAMILY "2"
         IPAD_SCREEN_ORIENTATIONS UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
         REQUIRES_FULL_SCREEN TRUE
     )
@@ -247,9 +246,7 @@ juce_add_plugin(${PROJECT_NAME}
     # sessions and presets). Never change it once released.
     LV2URI "https://namtrix.local/plugin"
     PRODUCT_NAME "NAMTRIX Player"
-    NEEDS_WEB_BROWSER ${NEEDS_WEB_BROWSER_VALUE}
     VST3_AUTO_MANIFEST ${VST3_MANIFEST}
-    NEEDS_WEBVIEW2 ${NEEDS_WEBVIEW2_VALUE}
     MICROPHONE_PERMISSION_ENABLED TRUE
     MICROPHONE_PERMISSION_TEXT "NAMTRIX Player needs microphone access for audio input processing."
     # Without this Info.plist key, macOS TCC kills the app the moment the
@@ -341,6 +338,10 @@ target_sources(${PROJECT_NAME}
         src/StereoOffset.cpp
         include/AutoOffset.h
         src/AutoOffset.cpp
+        include/LegacyParamIds.h
+        src/LegacyParamIds.cpp
+        include/PresetFile.h
+        src/PresetFile.cpp
         include/PresetManager.h
         src/PresetManager.cpp
         include/Processor.h
@@ -357,29 +358,38 @@ target_sources(${PROJECT_NAME}
         src/NamEngine.cpp
         include/TunerDetector.h
         src/TunerDetector.cpp
+        include/PitchShift.h
+        src/PitchShift.cpp
 )
+
 # Include GUI for Desktop builds
 if (NOT HEADLESS)
     target_sources(${PROJECT_NAME}
         PRIVATE
-            include/Editor.h
-            src/Editor.cpp
-            include/EditorWebViewSetup.h
-            src/EditorWebViewSetup.cpp
             include/StandaloneAudioSettings.h
             src/StandaloneAudioSettings.cpp
+            include/WindowKeyEvents.h
     )
+    # The editor (plugin/ui, see plugin/docs/native-ui.md): the shared UI
+    # sources plus the processor-backed pieces only the plugin has.
+    include("${CMAKE_CURRENT_SOURCE_DIR}/ui/NativeUi.cmake")
+    t3k_add_native_ui(${PROJECT_NAME})
+    target_sources(${PROJECT_NAME}
+        PRIVATE
+            ui/backend/ProcessorBackend.h
+            ui/backend/ProcessorBackend.cpp
+            ui/NativeEditor.h
+            ui/NativeEditor.cpp
+    )
+    if (T3K_BUILD_UI_TESTBED AND NOT T3K_IOS)
+        add_subdirectory(ui/testbed)
+    endif()
     # OS microphone-permission shim: AVFoundation (ObjC++) on macOS, a
     # best-effort stub elsewhere (see AudioPermissions.h).
     target_sources(${PROJECT_NAME} PRIVATE include/AudioPermissions.h)
     # iOS audio-route shim; header-only no-op on Windows and Linux.
     target_sources(${PROJECT_NAME} PRIVATE include/IosAudioRoute.h)
-    # Webview session clearing is platform-specific: WKWebsiteDataStore needs
-    # ObjC++ on Apple; elsewhere a best-effort JUCE fallback.
     if (APPLE)
-        target_sources(${PROJECT_NAME} PRIVATE src/WebViewCookies.mm)
-        # Hover/cursor fix for DAW-hosted windows (see WindowMouseEvents.mm).
-        target_sources(${PROJECT_NAME} PRIVATE src/WindowMouseEvents.mm)
         # Space passthrough to the host DAW (see WindowKeyEvents.mm).
         target_sources(${PROJECT_NAME} PRIVATE src/WindowKeyEvents.mm)
         target_sources(${PROJECT_NAME} PRIVATE src/AudioPermissions.mm)
@@ -387,7 +397,6 @@ if (NOT HEADLESS)
         # IosAudioRoute.h).
         target_sources(${PROJECT_NAME} PRIVATE src/IosAudioRoute.mm)
     else()
-        target_sources(${PROJECT_NAME} PRIVATE src/WebViewCookies.cpp)
         # Space passthrough to the host DAW (see WindowKeyEvents.cpp).
         target_sources(${PROJECT_NAME} PRIVATE src/WindowKeyEvents.cpp)
         if (UNIX)
@@ -486,37 +495,14 @@ target_link_libraries(${PROJECT_NAME}
 # Ensure NAM is built before plugin (force_load path requires lib to exist)
 add_dependencies(${PROJECT_NAME} NAM)
 
-
-if (NOT HEADLESS)
-    # Add Webview GUI files as binary data (built by npm run build in ui/)
-    file(GLOB_RECURSE WEB_ASSETS "${CMAKE_CURRENT_SOURCE_DIR}/webview/*.*")
-    # Fallback: CI configures before UI build; use placeholder so juce_add_binary_data succeeds.
-    # Reconfigure after "Build UI" step to pick up real assets.
-    if (NOT WEB_ASSETS)
-        file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/_webview_placeholder.txt" " ")
-        list(APPEND WEB_ASSETS "${CMAKE_CURRENT_BINARY_DIR}/_webview_placeholder.txt")
-    endif()
-
-    juce_add_binary_data(WebAssets
-    SOURCES ${WEB_ASSETS}
-    )
-
-    target_link_libraries(${PROJECT_NAME} PRIVATE WebAssets)
-    target_include_directories(${PROJECT_NAME}
-        PRIVATE ${WebAssets_BINARY_DIR}
-    )
-else()
-    # Generate a dummy BinaryData.h to avoid missing include errors
-    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/BinaryData.h" "// Empty stub for Embedded builds\n")
-    target_include_directories(${PROJECT_NAME}
-        PRIVATE ${CMAKE_CURRENT_BINARY_DIR}
-    )
-endif()
-
-# These definitions are recommended by JUCE.
+# No browser engine anywhere in the plugin: the UI is drawn by JUCE, so
+# juce_gui_extra's WebBrowserComponent (and its WebKitGTK / WebView2 runtime
+# dependencies) stays out of the build. Likewise the vendored libwebp
+# (JUCE 9.0.3+): nothing here reads or writes WebP.
 target_compile_definitions(${PROJECT_NAME}
     PUBLIC
-        JUCE_WEB_BROWSER=${JUCE_WEB_BROWSER_VALUE}
+        JUCE_WEB_BROWSER=0
+        JUCE_USE_WEBP=0
         JUCE_VST3_CAN_REPLACE_VST2=0
 )
 
@@ -549,25 +535,14 @@ endif()
 # mic dying system-wide while the app holds the guitar channel). The JACK
 # backend connects as a client instead, so on any PipeWire system
 # (pipewire-jack) or real JACK server the interface stays shared. libjack is
-# dlopened at runtime (libjack.so.0, JackNoStartServer) like curl/WebKit
-# above, so this adds no runtime dependency: without a JACK server the
+# dlopened at runtime (libjack.so.0, JackNoStartServer) like curl above,
+# so this adds no runtime dependency: without a JACK server the
 # driver just lists no devices. Build hosts need the JACK headers
 # (libjack-jackd2-dev; CI installs it). The JACK client name defaults to
 # JucePlugin_Name ("TONE3000"). Gated on NOT HEADLESS so embedded
 # toolchains don't grow a header dependency.
 if (UNIX AND NOT APPLE AND NOT HEADLESS)
     target_compile_definitions(${PROJECT_NAME} PUBLIC JUCE_JACK=1)
-endif()
-
-# Linux: stay on the classic core-X11 input path. JUCE 9 rewrote Linux input
-# around XInput2 (per-window XI2 registration, core ButtonPress/Motion events
-# discarded when XI2 >= 2.2 is present, which is every modern system). A missed
-# or racing XI2 registration leaves a window rendering but mouse-dead, seen
-# intermittently in the JUCE 9 standalone on Linux (resolved by relaunch). The
-# only feature XInput2 buys is multitouch, which this plugin doesn't use, so
-# disable the whole path and keep the battle-tested JUCE 8 behavior.
-if (UNIX AND NOT APPLE)
-    target_compile_definitions(${PROJECT_NAME} PUBLIC JUCE_USE_XINPUT=0)
 endif()
 
 # Use native macOS title bar for standalone app. On iOS there is no title bar
@@ -590,10 +565,6 @@ if (WIN32)
     # Prevent windows.h min/max macros from breaking std::min/std::max in AudioDSPTools and plugin code
     target_compile_definitions(${PROJECT_NAME} PUBLIC NOMINMAX)
     if (NOT HEADLESS)
-        target_compile_definitions(${PROJECT_NAME}
-            PUBLIC JUCE_USE_WIN_WEBVIEW2_WITH_STATIC_LINKING=1  # This will enable WebView2 as the WebView backend on Windows
-        )
-
         # ASIO driver support in the standalone's audio settings. JUCE keeps
         # ASIO off by default because it needs Steinberg's ASIO SDK headers,
         # which are a separate (non-redistributable) download:

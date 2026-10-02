@@ -7,6 +7,9 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#if !JUCE_WINDOWS
+#include <sys/stat.h>
+#endif
 
 // #####################################
 // MODEL LOADING HELPERS
@@ -15,10 +18,13 @@
 // IR block sizing constants.
 // TONE3000 IR tones cover two very different species: cab IRs (tens of
 // milliseconds) and convolution-reverb IRs (whole seconds). ONE length
-// cutoff (kShortIrMaxSeconds) classifies every IR as short or long, and
-// that classification drives everything downstream:
+// cutoff (kShortIrMaxSeconds) splits every IR into short or long, and that
+// split drives everything downstream:
 //   short: uniform zero-latency engine, -18 dB output pad, 100% default mix
 //   long:  non-uniform engine,           no output pad,     50% default mix
+// The engine choice is always by length (a CPU decision, inaudible). The
+// audible pair (pad, default mix) is by length only when the tone's catalog
+// gear doesn't already say what the IR is; see irIsLongFor.
 namespace {
 
 // Hard cap on loaded IR length. Bounds memory and engine-build time for
@@ -32,6 +38,21 @@ constexpr double kMaxIrSeconds = 10.0;
 // threshold is a constant.
 constexpr double kShortIrMaxSeconds = 1.0;
 constexpr int kShortIrMaxBaseSamples = static_cast<int>(kShortIrMaxSeconds * kChainBaseSampleRate);
+
+// The cab-like / reverb-like verdict for a loaded IR (ChainBlock::irIsLong),
+// from the tone's catalog gear and the kernel-length fallback. The gear tag
+// wins where it is unambiguous: a "cab" is a cab however much room tail or
+// trailing noise floor the file carries, and a "space" is a reverb however
+// short (github issue #89: a 389 ms chamber, and a cab whose fade-out dipped
+// under the trim floor just inside the cutoff, both used to flip on length
+// alone and land 18 dB and a mix default apart from their siblings). Every
+// other gear ("pedal", "experimental", untagged local files) genuinely mixes
+// both species, so there the length decides, as before.
+bool irIsLongFor(const juce::String& gear, bool longByLength) {
+  if (gear.equalsIgnoreCase("cab")) return false;
+  if (gear.equalsIgnoreCase("space")) return true;
+  return longByLength;
+}
 
 // Long IRs use JUCE's two-stage non-uniform engine (still zero latency):
 // the first kIrNonUniformHeadSamples convolve in callback-sized partitions,
@@ -121,7 +142,13 @@ bool namConfigIsParametric(const nlohmann::json& modelJson) {
 // file; stale entries age out (see cleanLocalModelStash). Same app-data
 // root as PresetManager. Persisted URLs are resolved back to this folder by
 // resolveLocalModelFile, which is what survives the iOS container rotating.
-juce::File localModelsDir() { return TONE3000Processor::localModelStashDir(); }
+juce::File localModelsDir() {
+  juce::File base = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory);
+#if JUCE_MAC
+  base = base.getChildFile("Application Support");
+#endif
+  return base.getChildFile("TONE3000").getChildFile("LocalModels");
+}
 
 // FNV-1a over the file bytes: stable across sessions and platforms without
 // pulling in juce_cryptography. The size suffix in the stash name backs up
@@ -136,38 +163,48 @@ juce::uint64 fnv1a64(const void* data, size_t size) {
   return hash;
 }
 
-// Some catalog WAVs end in an odd-sized chunk but omit the RIFF pad byte
-// that odd chunks require (their header's RIFF size counts it, the file
-// doesn't ship it). JUCE 9's WAV reader rejects such a chunk outright (its
-// rounded-up length overruns the stream, tripping the malformed-chunk
-// guard), so the file reads as zero samples: the convolver got an empty
-// kernel and short cab IRs silently degraded to a dry passthrough. Every
-// audio byte is present, though; detecting exactly this shape (declared
-// RIFF size == real size + 1) lets one appended zero byte make the file
-// spec-compliant without touching a sample.
-bool wavMissingRiffPadByte(const void* data, size_t size) {
-  if (size < 44)
-    return false;
-  const auto* bytes = static_cast<const uint8_t*>(data);
-  if (std::memcmp(bytes, "RIFF", 4) != 0 || std::memcmp(bytes + 8, "WAVE", 4) != 0)
-    return false;
-  const auto declared = static_cast<juce::uint64>(juce::ByteOrder::littleEndianInt(bytes + 4));
-  return declared + 8 == static_cast<juce::uint64>(size) + 1;
-}
-
-// Caps for local file loads, mirroring the web UI's drop limits
-// (useToneLoadFlow.ts): the same rules must hold whether the bytes arrive
-// as base64 over the bridge (drops) or straight from disk (the tile menus'
-// Load File / Load Folder pickers).
+// Caps for local file loads, the same whether the bytes arrive as a
+// base64 array (the DSP tests) or straight from disk (the UI's drops and
+// pickers, plugin/ui/services/LocalFiles).
 constexpr juce::int64 kMaxLocalFileBytes = 50 * 1024 * 1024;
 constexpr int kMaxFolderModels = 300;
+
+// Best-effort catalog gear id ("amp", "amp-cab", "cab", "pedal", "outboard")
+// for a local NAM file, from the trainer-written `metadata.gear_type`. The
+// field is free text, so only the common spellings map; anything else (or
+// no metadata at all) is "" and the UI keeps its generic file glyph.
+juce::String localGearFromNamMetadata(const nlohmann::json& config) {
+  const auto metadata = config.find("metadata");
+  if (metadata == config.end() || !metadata->is_object())
+    return {};
+  const auto gearType = metadata->find("gear_type");
+  if (gearType == metadata->end() || !gearType->is_string())
+    return {};
+
+  const juce::String type = juce::String(gearType->get<std::string>()).trim().toLowerCase();
+  if (type == "amp" || type == "pedal_amp" || type == "preamp") return "amp";
+  if (type == "amp_cab" || type == "amp_pedal_cab" || type == "amp-cab") return "amp-cab";
+  if (type == "studio" || type == "outboard") return "outboard";
+  if (type == "pedal") return "pedal";
+  if (type == "cab") return "cab";
+  return {};
+}
+
+// Same for a local IR: a kernel on the cab side of the short/long cutoff is
+// a cab; anything longer (reverbs, rooms) stays generic.
+juce::String localGearFromIr(const juce::AudioFormatReader& reader) {
+  if (reader.sampleRate <= 0.0)
+    return {};
+  const double seconds = static_cast<double>(reader.lengthInSamples) / reader.sampleRate;
+  return seconds <= kShortIrMaxSeconds ? "cab" : juce::String();
+}
 
 // One local file's bytes: validate and stash a content-addressed copy.
 // Validation happens here, at load time, instead of letting a bad file
 // reach the background loader: its failure surfaces as a retry badge, which
 // is the wrong affordance for a file that can never load. Returns the model
-// object { id, name, model_url } for the synthetic tone, or void with
-// `error` set to a user-facing message.
+// object { id, name, model_url[, gear] } for the synthetic tone, or void
+// with `error` set to a user-facing message.
 juce::var stashLocalBytes(const juce::String& filename, juce::MemoryOutputStream& decoded,
                           juce::String& error) {
   auto fail = [&](const juce::String& message) {
@@ -181,23 +218,20 @@ juce::var stashLocalBytes(const juce::String& filename, juce::MemoryOutputStream
   if (!isNam && extension != "wav")
     return fail("Only .nam and .wav files are supported");
 
+  // Inferred while the file is open for validation anyway (see
+  // localGearFromNamMetadata / localGearFromIr); "" when unknown.
+  juce::String gear;
   if (isNam) {
     try {
       const auto* bytes = static_cast<const char*>(decoded.getData());
       const nlohmann::json config = nlohmann::json::parse(bytes, bytes + decoded.getDataSize());
       if (!namConfigIsA2(config) && !namConfigIsParametric(config))
         return fail("Only A2 and parametric NAM files are supported");
+      gear = localGearFromNamMetadata(config);
     } catch (const std::exception&) {
       return fail("Not a valid NAM file");
     }
   } else {
-    // Repair before validating: a WAV missing its final RIFF pad byte would
-    // otherwise be rejected here as unreadable. The repaired bytes are what
-    // get stashed (and content-hashed), so downstream loads read a
-    // spec-compliant file.
-    if (wavMissingRiffPadByte(decoded.getData(), decoded.getDataSize()))
-      decoded.writeByte(0);
-
     juce::AudioFormatManager formatManager;
     formatManager.registerBasicFormats();
     std::unique_ptr<juce::AudioFormatReader> reader(formatManager.createReaderFor(
@@ -205,6 +239,7 @@ juce::var stashLocalBytes(const juce::String& filename, juce::MemoryOutputStream
                                                   false)));
     if (reader == nullptr || reader->lengthInSamples <= 0)
       return fail("Not a valid WAV file");
+    gear = localGearFromIr(*reader);
   }
 
   const juce::uint64 hash = fnv1a64(decoded.getData(), decoded.getDataSize());
@@ -212,7 +247,13 @@ juce::var stashLocalBytes(const juce::String& filename, juce::MemoryOutputStream
       juce::String::toHexString(static_cast<juce::int64>(hash)) + "-" +
       juce::String(static_cast<juce::int64>(decoded.getDataSize())) + "." + extension);
   if (!stash.existsAsFile()) {
-    stash.getParentDirectory().createDirectory();
+    // The stash folder can exist without being writable (root-owned after a
+    // sudo'd install script or a restored backup; github issue #76 saw every
+    // drop fail here while validation kept passing). ensureWritableDir heals
+    // what it can; a folder that stays unwritable gets its own message so
+    // the report names the disease, not the symptom.
+    if (!TONE3000Processor::ensureWritableDir(stash.getParentDirectory()))
+      return fail("TONE3000's data folder isn't writable");
     if (!stash.replaceWithData(decoded.getData(), decoded.getDataSize()))
       return fail("Couldn't store the dropped file");
   } else {
@@ -228,69 +269,14 @@ juce::var stashLocalBytes(const juce::String& filename, juce::MemoryOutputStream
   model->setProperty("id", static_cast<int>(hash % 0x7ffffffe) + 1);
   model->setProperty("name", filename.upToLastOccurrenceOf(".", false, false));
   model->setProperty("model_url", juce::URL(stash).toString(false));
+  if (gear.isNotEmpty())
+    model->setProperty("gear", gear);
   return juce::var(model.get());
 }
 
-// Cover art for a local model: an image file sitting beside it with the same
-// base name ("plexi.nam" + "plexi.png"). Copied into the same content-addressed
-// stash as the models so the artwork survives the original folder moving, and
-// so it ages out with the same GC.
-//
-// Only reachable for path-based loads (the Load File / Load Folder pickers). A
-// drag-and-drop hands the webview file *bytes* with no directory, so there is
-// nothing to look beside -- see loadLocalTone.
-//
-// Returns the URL the webview should request (served by
-// TONE3000Editor::getResource), or an empty string when there is no sibling.
-juce::String stashSiblingImage(const juce::File& modelFile) {
-  // Order is the preference order when several siblings exist.
-  static const char* kImageExtensions[] = {".png", ".jpg", ".jpeg", ".webp", ".gif"};
-  // Cover art is decoration: skip anything big rather than copying a 40 MB TIFF
-  // into the stash and pushing it through the webview on every block render.
-  static constexpr juce::int64 kMaxImageBytes = 8 * 1024 * 1024;
-
-  const juce::File directory = modelFile.getParentDirectory();
-  const juce::String stem = modelFile.getFileNameWithoutExtension();
-
-  for (const char* extension : kImageExtensions) {
-    const juce::File candidate = directory.getChildFile(stem + extension);
-    if (!candidate.existsAsFile() || candidate.getSize() <= 0)
-      continue;
-    if (candidate.getSize() > kMaxImageBytes) {
-      juce::Logger::writeToLog("[LocalLoad] Cover art too large, ignoring: " +
-                               candidate.getFileName());
-      continue;
-    }
-
-    juce::MemoryBlock bytes;
-    if (!candidate.loadFileAsData(bytes) || bytes.getSize() == 0)
-      continue;
-
-    const juce::uint64 hash = fnv1a64(bytes.getData(), bytes.getSize());
-    const juce::String stashName = juce::String::toHexString(static_cast<juce::int64>(hash)) + "-" +
-                                   juce::String(static_cast<juce::int64>(bytes.getSize())) +
-                                   juce::String(extension);
-    const juce::File stash = localModelsDir().getChildFile(stashName);
-    if (!stash.existsAsFile()) {
-      stash.getParentDirectory().createDirectory();
-      if (!stash.replaceWithData(bytes.getData(), bytes.getSize()))
-        continue;
-    } else {
-      // Same bytes already stashed: refresh the GC liveness stamp.
-      stash.setLastModificationTime(juce::Time::getCurrentTime());
-    }
-
-    juce::Logger::writeToLog("[LocalLoad] Cover art: " + candidate.getFileName());
-    // Root-relative, so the webview resolves it against its own origin; a
-    // file:// URL would be blocked as cross-origin.
-    return "/" + stashName;
-  }
-  return {};
-}
-
-// A dropped file as shipped by the webview: { name, data } with base64
-// bytes (the DOM never exposes file paths, so drops ride the bridge as
-// base64; see useToneLoadFlow.ts).
+// A file shipped as { name, data } with base64 bytes. The DSP tests feed
+// files this way (it predates the on-disk path below, from when the UI
+// could only hand over bytes); the UI itself always has a path.
 juce::var stashLocalFile(const juce::String& filename, const juce::String& base64Data,
                          juce::String& error) {
   juce::MemoryOutputStream decoded;
@@ -318,7 +304,7 @@ juce::var stashLocalFileFromDisk(const juce::File& file, juce::String& error) {
 // A file the OS document picker handed us as a security-scoped URL.
 //
 // iOS is the reason this exists, and iOS is the only caller (see
-// pickLocalToneFile); it is compiled everywhere so the DSP suite, which does
+// LocalFiles::pick); it is compiled everywhere so the DSP suite, which does
 // not build for iOS, can exercise the same code the iPad runs. Everything the
 // picker returns from the Files app lives outside the app sandbox (an iCloud /
 // file-provider container), and
@@ -482,8 +468,7 @@ juce::var TONE3000Processor::loadLocalTonePath(const juce::File& source,
       models.add(model);
     }
 
-    return finishLocalToneLoad(title, models, firstError, picked.size(), targetInsertId,
-                               stashSiblingImage(picked.getReference(0)));
+    return finishLocalToneLoad(title, models, firstError, picked.size(), targetInsertId);
   }
 
   const juce::String title = source.getFileNameWithoutExtension();
@@ -498,7 +483,7 @@ juce::var TONE3000Processor::loadLocalTonePath(const juce::File& source,
   if (!model.isObject())
     return localToneError(title, error);
 
-  return finishLocalToneLoad(title, {model}, {}, 1, targetInsertId, stashSiblingImage(source));
+  return finishLocalToneLoad(title, {model}, {}, 1, targetInsertId);
 }
 
 juce::var TONE3000Processor::loadLocalToneUrls(const juce::Array<juce::URL>& sources,
@@ -507,7 +492,7 @@ juce::var TONE3000Processor::loadLocalToneUrls(const juce::Array<juce::URL>& sou
   // can hand back a folder URL, but a security-scoped directory cannot be
   // enumerated through juce::URL (there is no listing API behind the
   // bookmark), so "Load Folder" asks for the files themselves instead. See
-  // pickLocalToneFile. Not gated on JUCE_IOS so the DSP suite can run it;
+  // LocalFiles::pick. Not gated on JUCE_IOS so the DSP suite can run it;
   // the editor only reaches it on iOS.
   if (sources.isEmpty())
     return localToneError("Load Files", "Nothing to load");
@@ -552,8 +537,7 @@ juce::var TONE3000Processor::loadLocalToneUrls(const juce::Array<juce::URL>& sou
 juce::var TONE3000Processor::finishLocalToneLoad(const juce::String& title,
                                                  const juce::Array<juce::var>& stashedModels,
                                                  const juce::String& firstError, int fileCount,
-                                                 const std::string& targetInsertId,
-                                                 const juce::String& imageUrl) {
+                                                 const std::string& targetInsertId) {
   // Identical bytes under two names would collide on the content-derived
   // id (cache key, picker selection); the first name wins.
   juce::Array<juce::var> models;
@@ -579,10 +563,13 @@ juce::var TONE3000Processor::finishLocalToneLoad(const juce::String& title,
   tone->setProperty("title", title);
   tone->setProperty("format", isNam ? "nam" : "ir");
   tone->setProperty("models", models);
-  // Cover art found beside the file, if any. Same shape as a catalog tone's
-  // images array, so the UI renders it through the existing path.
-  if (imageUrl.isNotEmpty())
-    tone->setProperty("images", juce::Array<juce::var>{juce::var(imageUrl)});
+
+  // Same catalog `gear` field a TONE3000 tone carries, inferred from the
+  // first file (see stashLocalBytes); the tile draws that gear's glyph
+  // instead of the generic file icon. Absent when nothing could be inferred.
+  const juce::String gear = models.getReference(0)["gear"].toString();
+  if (gear.isNotEmpty())
+    tone->setProperty("gear", gear);
 
   const juce::String toneJson = juce::JSON::toString(juce::var(tone.get()));
 
@@ -644,6 +631,56 @@ void TONE3000Processor::cleanLeakedIrTempFiles() {
   });
 }
 
+bool TONE3000Processor::ensureWritableDir(const juce::File& dir) {
+  if (dir.isDirectory() && dir.hasWriteAccess())
+    return true;
+
+  // A folder the user still owns with stripped write bits (restored backup)
+  // is fixable in place with a chmod, which keeps its contents where they
+  // are. chmod is owner-only, so this quietly does nothing to a root-owned
+  // folder, which falls through to the rename below. The owner's write bit
+  // only: juce::File::setReadOnly(false) would also grant group and world
+  // (0555 -> 0777), and the folder holds the user's sign-in tokens.
+  const auto restoreOwnerWrite = [&dir] {
+#if JUCE_WINDOWS
+    return dir.setReadOnly(false);
+#else
+    struct stat st {};
+    const juce::String path = dir.getFullPathName();
+    return ::stat(path.toRawUTF8(), &st) == 0 &&
+           ::chmod(path.toRawUTF8(), (st.st_mode & 07777) | S_IWUSR) == 0;
+#endif
+  };
+  if (dir.isDirectory() && restoreOwnerWrite() && dir.hasWriteAccess()) {
+    juce::Logger::writeToLog("[AppData] Restored write permission on " + dir.getFullPathName());
+    return true;
+  }
+
+  if (dir.exists()) {
+    // What chmod can't fix: a file squatting on the path, or a directory
+    // owned by someone else (root, after a sudo'd install script). chown-ing
+    // it back needs privileges we don't have, but the parent belongs to the
+    // user, so *renaming* the broken node aside works (though older macOS,
+    // seen on the macos-14 CI runner, refuses to rename an unwritable
+    // directory; current macOS allows it). Nothing is deleted: the sibling
+    // keeps whatever is inside for manual recovery, and the log names it.
+    const juce::File aside =
+        dir.getSiblingFile(dir.getFileName() + ".unwritable").getNonexistentSibling();
+    if (dir.moveFileTo(aside))
+      juce::Logger::writeToLog("[AppData] Moved unusable " + dir.getFullPathName() +
+                               " aside to " + aside.getFileName());
+    else
+      juce::Logger::writeToLog("[AppData] " + dir.getFullPathName() +
+                               " is not writable and couldn't be moved aside");
+  }
+
+  const juce::Result created = dir.createDirectory();
+  if (created.failed())
+    juce::Logger::writeToLog("[AppData] Couldn't create " + dir.getFullPathName() + ": " +
+                             created.getErrorMessage());
+  return dir.isDirectory() && dir.hasWriteAccess();
+}
+
 int TONE3000Processor::sweepLeakedIrTempFiles(const juce::File& tempDir) {
   // Builds through v0.0.2 wrote one "<uuid>_ir.wav" per IR engine build into
   // the OS temp dir and never deleted it (github issue #25: hundreds of MB
@@ -667,14 +704,6 @@ juce::String TONE3000Processor::localFileNameFromUrl(const juce::URL& url) {
   if (url.isLocalFile())
     return url.getLocalFile().getFileName();
   return juce::URL::removeEscapeChars(url.getFileName());
-}
-
-juce::File TONE3000Processor::localModelStashDir() {
-  juce::File base = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory);
-#if JUCE_MAC
-  base = base.getChildFile("Application Support");
-#endif
-  return base.getChildFile("TONE3000").getChildFile("LocalModels");
 }
 
 juce::File TONE3000Processor::resolveLocalModelFile(const juce::File& stashRoot,
@@ -722,9 +751,11 @@ void TONE3000Processor::refreshLocalStashCopy(const juce::String& modelUrl,
   // The bytes came from an embedded cache but the stash copy is gone (GC'd,
   // or a preset from another machine): put it back so paths that need the
   // file (undo of a remove, retry) keep working.
-  stash.getParentDirectory().createDirectory();
-  if (stash.replaceWithData(bytes.data(), bytes.size()))
+  if (ensureWritableDir(stash.getParentDirectory()) &&
+      stash.replaceWithData(bytes.data(), bytes.size()))
     juce::Logger::writeToLog("[LocalLoad] Restored stash copy " + stash.getFileName());
+  else
+    juce::Logger::writeToLog("[LocalLoad] Couldn't restore stash copy " + stash.getFileName());
 }
 
 std::vector<uint8_t> TONE3000Processor::fetchModelFromUrl(const juce::String& modelUrl) {
@@ -864,10 +895,15 @@ TONE3000Processor::PreparedBlockModel TONE3000Processor::prepareBlockModelOffThr
 
       // Oversampling: phase-safe architectures get one native-rate instance
       // per phase (see NamEngine.h); anything else runs a single instance
-      // time-scaled at the full chain rate.
+      // time-scaled at the full chain rate. Dual mono doubles the set: one
+      // independent voice per channel (voice-major layout). Both counts are
+      // read once here and baked into the engine; the apply path re-queues
+      // the build if either requirement moved while it was in flight.
       const int oversampleFactor = chainOversampleFactor.load();
+      const int voices = wantedNamVoices();
       const bool phaseSafe = oversampleFactor > 1 && namConfigIsPhaseSafe(config);
-      const int instanceCount = phaseSafe ? oversampleFactor : 1;
+      const int phaseCount = phaseSafe ? oversampleFactor : 1;
+      const int instanceCount = phaseCount * voices;
       if (oversampleFactor > 1 && !phaseSafe) {
         juce::Logger::writeToLog(
             "[ModelLoader] NAM architecture '" +
@@ -895,7 +931,7 @@ TONE3000Processor::PreparedBlockModel TONE3000Processor::prepareBlockModelOffThr
         instances.push_back(std::move(rawDsp));
       }
 
-      auto engine = std::make_unique<NamEngine>(std::move(instances), oversampleFactor);
+      auto engine = std::make_unique<NamEngine>(std::move(instances), oversampleFactor, voices);
 
       // The chain domain runs everything at the chain rate. A2 models are
       // all trained at 48k; anything else is rare enough that we just run it
@@ -933,7 +969,8 @@ TONE3000Processor::PreparedBlockModel TONE3000Processor::prepareBlockModelOffThr
       juce::Logger::writeToLog(
           "[ModelLoader] NAM model prepared, model sample rate: " +
           juce::String(out.namEngine->getModelSampleRate()) +
-          (phaseSafe ? " (" + juce::String(instanceCount) + " phase instances)" : ""));
+          (phaseSafe ? " (" + juce::String(phaseCount) + " phase instances)" : "") +
+          (voices > 1 ? " (" + juce::String(voices) + " voices)" : ""));
 
       out.success = true;
     } else {
@@ -954,15 +991,6 @@ TONE3000Processor::PreparedBlockModel TONE3000Processor::prepareBlockModelOffThr
         juce::Logger::writeToLog("[ModelLoader] Failed to create temporary IR file: " +
                                  tempFile.getFullPathName());
         return out;
-      }
-
-      // The bytes can come from any source (fresh download, model cache,
-      // embedded DAW/preset state), so the pad-byte repair lives here, at
-      // the last common point before JUCE reads the file.
-      if (wavMissingRiffPadByte(modelData.data(), modelData.size())) {
-        const char pad = 0;
-        tempFile.appendData(&pad, 1);
-        juce::Logger::writeToLog("[ModelLoader] Repaired missing RIFF pad byte: " + filename);
       }
 
       juce::AudioFormatManager formatManager;
@@ -1058,21 +1086,23 @@ TONE3000Processor::PreparedBlockModel TONE3000Processor::prepareBlockModelOffThr
       }
 
       // The engine was built synchronously above, so it can report the real
-      // (trimmed + resampled) kernel length, the basis for the short/long
-      // classification and the host tail report. Fall back to the pre-trim
-      // bound defensively.
+      // (trimmed + resampled) kernel length, the basis for the length verdict
+      // and the host tail report. Fall back to the pre-trim bound
+      // defensively. (The block's final cab/reverb classification also
+      // weighs the tone's gear, which only the apply step knows; see
+      // irIsLongFor.)
       const int engineIrSamples = out.convolverMono->getCurrentIRSize();
       const int irLengthBaseSamples = engineIrSamples > 0 ? engineIrSamples : irLengthUpperBound;
 
       out.irNumChannels = irNumChannels;
       out.irLengthBaseSamples = irLengthBaseSamples;
-      out.irIsLong = irLengthBaseSamples > kShortIrMaxBaseSamples;
+      out.irIsLongByLength = irLengthBaseSamples > kShortIrMaxBaseSamples;
       out.irNormalizationGainLinear = computeIrNormalizationGain(tempFile, maxIrFileSamples);
 
       juce::Logger::writeToLog(
           "[ModelLoader] IR prepared: " + juce::String(irNumChannels) + " ch, " +
           juce::String(irLengthBaseSamples / kChainBaseSampleRate, 2) + " s (" +
-          (out.irIsLong ? "long" : "short") + ", norm " +
+          (out.irIsLongByLength ? "long" : "short") + ", norm " +
           juce::String(juce::Decibels::gainToDecibels(out.irNormalizationGainLinear), 1) + " dB)");
       out.success = true;
     }
@@ -1275,19 +1305,26 @@ void TONE3000Processor::applyPreparedModelToChainBlock(ChainBlock& block, ChainB
     return;
   }
 
-  // An oversampling change can race an in-flight load: the engine was built
-  // with the old factor's phase count and can't be re-prepared into the new
-  // one. Drop it and re-queue; the rebuild reads the settled factor and
-  // reuses the block's in-memory model cache (no network).
-  if (newType == ChainBlockType::NAM && prepared.namEngine != nullptr &&
-      prepared.namEngine->getOversampleFactor() != chainOversampleFactor.load()) {
-    juce::Logger::writeToLog("[ModelLoader] Oversampling factor changed during prepare (×" +
-                             juce::String(prepared.namEngine->getOversampleFactor()) + " -> ×" +
-                             juce::String(chainOversampleFactor.load()) + "); re-queuing block " +
-                             juce::String(block.id));
-    block.modelLoading = true;
-    queueActiveModelLoad(block);
-    return;
+  // An oversampling or input-mode change can race an in-flight load: the
+  // engine was built with the old factor's phase count or the old mode's
+  // voice count, and neither can be re-prepared into the new one. Drop it
+  // and re-queue; the rebuild reads the settled requirements and reuses the
+  // block's in-memory model cache (no network).
+  if (newType == ChainBlockType::NAM && prepared.namEngine != nullptr) {
+    const int liveFactor = chainOversampleFactor.load();
+    const int liveVoices = wantedNamVoices();
+    if (prepared.namEngine->getOversampleFactor() != liveFactor ||
+        prepared.namEngine->getVoiceCount() != liveVoices) {
+      juce::Logger::writeToLog(
+          "[ModelLoader] Chain requirements changed during prepare (×" +
+          juce::String(prepared.namEngine->getOversampleFactor()) + " -> ×" +
+          juce::String(liveFactor) + ", " + juce::String(prepared.namEngine->getVoiceCount()) +
+          " -> " + juce::String(liveVoices) + " voices); re-queuing block " +
+          juce::String(block.id));
+      block.modelLoading = true;
+      queueActiveModelLoad(block);
+      return;
+    }
   }
 
   // A restore-time prepare can race prepareToPlay: the engine may have been
@@ -1355,7 +1392,17 @@ void TONE3000Processor::applyPreparedModelToChainBlock(ChainBlock& block, ChainB
     std::swap(block.convolverStereo, prepared.convolverStereo);
     block.irNumChannels = prepared.irNumChannels;
     block.irLengthBaseSamples = prepared.irLengthBaseSamples;
-    block.irIsLong = prepared.irIsLong;
+
+    // Cab-like or reverb-like: the tone's gear where it is decisive, the
+    // kernel length otherwise (see irIsLongFor). toneVar is already the
+    // tone this engine belongs to; a swap sets it before queueing the load.
+    const juce::String gear = block.toneVar["gear"].toString();
+    block.irIsLong = irIsLongFor(gear, prepared.irIsLongByLength);
+    if (block.irIsLong != prepared.irIsLongByLength)
+      juce::Logger::writeToLog("[ModelLoader] IR classified " +
+                               juce::String(block.irIsLong ? "long" : "short") + " by gear '" +
+                               gear + "' (length said " +
+                               (prepared.irIsLongByLength ? "long" : "short") + ")");
 
     // The base-rate island around the convolvers: blocks added mid-session
     // were never seen by prepareChain, so (re)prepare it here with the same

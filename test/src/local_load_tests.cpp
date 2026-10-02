@@ -13,6 +13,11 @@
 
 #include <gtest/gtest.h>
 
+#if !JUCE_WINDOWS
+#include <sys/stat.h>  // chmod, for the unwritable-directory heal test
+#include <unistd.h>    // geteuid: root ignores permission bits, so that leg skips
+#endif
+
 namespace {
 
 juce::String base64Of(const juce::File& file) {
@@ -226,6 +231,44 @@ TEST(LocalLoadTest, SnapshotNamExposesNoKnobs) {
   EXPECT_TRUE(block["namParamSpecs"].isVoid());
   EXPECT_TRUE(block["params"]["namParamValues"].isVoid());
   EXPECT_FALSE(proc.setBlockNamParam(res["blockId"].toString().toStdString(), 0, 1.0));
+// The tile's glyph: a local tone carries the catalog `gear` id when native
+// could infer one from the file, and no `gear` at all otherwise (the UI then
+// keeps its generic file icon). Folders take the first file's answer.
+TEST(LocalLoadTest, GearIsInferredFromNamMetadataAndIrLength) {
+  const auto gearOf = [](const juce::String& title, const juce::Array<juce::var>& files) {
+    TONE3000Processor proc;
+    const juce::var res = proc.loadLocalTone(title, filesOf(files));
+    EXPECT_TRUE(res["error"].isVoid()) << res["error"].toString().toStdString();
+    EXPECT_TRUE(waitForChainLoaded(proc));
+    return firstToneBlock(proc)["tone"]["gear"];
+  };
+
+  // metadata.gear_type spellings map onto the catalog ids.
+  EXPECT_EQ(gearOf("amp", {testFileEntry("a2-am-test-2.nam")}).toString(), juce::String("amp"));
+  EXPECT_EQ(gearOf("amp cab", {testFileEntry("a2-amp-cab-test.nam")}).toString(),
+            juce::String("amp-cab"));
+  // No metadata: no gear (not an amp by default).
+  EXPECT_TRUE(gearOf("plain", {testFileEntry("a2-amp-test.nam")}).isVoid());
+
+  // Unknown free text stays unknown: the real A2 file with a made-up type.
+  juce::var odd = juce::JSON::parse(testFile("a2-amp-test.nam"));
+  juce::DynamicObject::Ptr metadata = new juce::DynamicObject();
+  metadata->setProperty("gear_type", "synth");
+  odd.getDynamicObject()->setProperty("metadata", juce::var(metadata.get()));
+  const juce::String oddJson = juce::JSON::toString(odd);
+  EXPECT_TRUE(gearOf("odd", {fileEntry("odd.nam", juce::Base64::toBase64(
+                                                       oddJson.toRawUTF8(),
+                                                       oddJson.getNumBytesAsUTF8()))})
+                  .isVoid());
+
+  // IRs: cab-length kernels are cabs, reverbs stay generic.
+  EXPECT_EQ(gearOf("cab", {testFileEntry("cab-ir-test.wav")}).toString(), juce::String("cab"));
+  EXPECT_TRUE(gearOf("verb", {testFileEntry("reverb-ir-mono-test.wav")}).isVoid());
+
+  // Folder: the first file decides.
+  EXPECT_EQ(gearOf("pack", {testFileEntry("a2-amp-cab-test.nam"), testFileEntry("a2-am-test-2.nam")})
+                .toString(),
+            juce::String("amp-cab"));
 }
 
 TEST(LocalLoadTest, RejectsBadFilesAndSkipsThemInFolders) {
@@ -473,4 +516,68 @@ TEST(LocalLoadTest, UrlsSingleFileTitlesFromNameAndRejectBadInputs) {
 
   EXPECT_TRUE(firstToneBlock(rejecting).isVoid());
   dir.deleteRecursively();
+}
+
+// ensureWritableDir heals the app-data wound behind github issue #76: a
+// folder left root-owned (sudo'd install script, restored backup) fails
+// every stash and settings write while reads keep working. The plugin can't
+// chown it back; it renames the broken node aside (the parent belongs to
+// the user) and starts fresh, deleting nothing.
+TEST(LocalLoadTest, EnsureWritableDirCreatesHealsAndPreservesEvidence) {
+  const juce::File tmp = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                             .getChildFile("t3k-ensure-" + juce::Uuid().toString());
+  ASSERT_TRUE(tmp.createDirectory().wasOk());
+
+  // Missing: created outright.
+  const juce::File fresh = tmp.getChildFile("data");
+  EXPECT_TRUE(TONE3000Processor::ensureWritableDir(fresh));
+  EXPECT_TRUE(fresh.isDirectory());
+
+  // Healthy: untouched, contents kept, nothing moved aside.
+  ASSERT_TRUE(fresh.getChildFile("keep.bin").replaceWithText("bytes"));
+  EXPECT_TRUE(TONE3000Processor::ensureWritableDir(fresh));
+  EXPECT_TRUE(fresh.getChildFile("keep.bin").existsAsFile());
+  EXPECT_EQ(tmp.findChildFiles(juce::File::findFilesAndDirectories, false).size(), 1);
+
+  // A file squatting on the path: moved aside with its bytes, a directory
+  // takes its place.
+  const juce::File squat = tmp.getChildFile("squat");
+  ASSERT_TRUE(squat.replaceWithText("old"));
+  EXPECT_TRUE(TONE3000Processor::ensureWritableDir(squat));
+  EXPECT_TRUE(squat.isDirectory());
+  bool asideKeptBytes = false;
+  for (const auto& sibling : tmp.findChildFiles(juce::File::findFiles, false))
+    if (sibling.getFileName().startsWith("squat") && sibling.loadFileAsString() == "old")
+      asideKeptBytes = true;
+  EXPECT_TRUE(asideKeptBytes);
+
+#if !JUCE_WINDOWS
+  // The restored-backup shape: a directory the user still owns, write bits
+  // stripped. Healed in place by putting the mode back, so its contents
+  // never move. The root-owned variant takes the rename-aside path instead;
+  // a test can't stage that unprivileged, and root sails past permission
+  // bits anyway, so this leg is unprivileged-only.
+  if (geteuid() != 0) {
+    const juce::File locked = tmp.getChildFile("locked");
+    ASSERT_TRUE(locked.createDirectory().wasOk());
+    ASSERT_TRUE(locked.getChildFile("old.t3kpreset").replaceWithText("preset"));
+    ASSERT_EQ(::chmod(locked.getFullPathName().toRawUTF8(), 0555), 0);
+    ASSERT_FALSE(locked.hasWriteAccess());
+
+    EXPECT_TRUE(TONE3000Processor::ensureWritableDir(locked));
+    EXPECT_TRUE(locked.isDirectory());
+    EXPECT_TRUE(locked.hasWriteAccess());
+    EXPECT_TRUE(locked.getChildFile("old.t3kpreset").existsAsFile());
+    // Only the owner got the write bit back: the folder holds the user's
+    // sign-in tokens, so 0555 must heal to 0755, never 0777.
+    struct stat healed {};
+    ASSERT_EQ(::stat(locked.getFullPathName().toRawUTF8(), &healed), 0);
+    EXPECT_EQ(healed.st_mode & 0777, 0755u);
+    // Nothing moved aside: the fix happened in place.
+    for (const auto& sibling : tmp.findChildFiles(juce::File::findDirectories, false))
+      EXPECT_TRUE(sibling == locked || !sibling.getFileName().startsWith("locked"));
+  }
+#endif
+
+  EXPECT_TRUE(tmp.deleteRecursively());
 }

@@ -1,5 +1,7 @@
 #include "Processor.h"
 
+#include "LegacyParamIds.h"
+
 // #############################
 // INTERNAL PRESETS
 // #############################
@@ -17,7 +19,10 @@ const std::vector<juce::String>& TONE3000Processor::presetParameterIds() {
   static const std::vector<juce::String> ids = {
       "inputLevel",     "outputLevel",      "outputBalance",
       "toneBass",       "toneMid",          "toneTreble",
-      "gateThreshold",  "gateEnabled",      "toneEqEnabled",
+      "gateThreshold",  "gateEnabled",      "gateRelease",
+      "gateHold",       "gateRange",        "toneEqEnabled",
+      "pitchEnabled",   "pitchSemitones",   "pitchStep",
+      "pitchTonality",  "pitchWindow",
       "spreadEnabled",  "spreadOffset",     "spreadWobble",
       "spreadWobbleEnabled", "spreadCrossover", "spreadCrossoverEnabled",
       "spreadDiffuseEnabled",
@@ -152,10 +157,13 @@ bool TONE3000Processor::loadPreset(const juce::String& presetId) {
 
   // Faceplate parameters: every preset-managed id is set, entries missing
   // from the file (saved before a parameter existed) land on the parameter
-  // default, so a preset always restores the same rig. Gestured so hosts
+  // default, so a preset always restores the same rig. Ids an older build
+  // wrote are renamed first (in this call's copy of the tree; the file is
+  // rewritten with the current ids on its next save). Gestured so hosts
   // treat this like a user edit (automation write modes record it instead
   // of fighting it).
-  const juce::ValueTree params = preset.getChildWithName("Params");
+  juce::ValueTree params = preset.getChildWithName("Params");
+  t3k::legacy_ids::migrateParamIds(params, "id");
   for (const auto& paramId : presetParameterIds()) {
     auto* p = parameters.getParameter(paramId);
     if (p == nullptr)

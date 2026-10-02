@@ -1,6 +1,9 @@
 #include "Processor.h"
 
+#include <atomic>
 #include <cstring>
+
+#include "LegacyParamIds.h"
 
 // #############################
 // STATE PERSISTENCE
@@ -9,14 +12,24 @@
 // Machine-wide user settings.
 // Shared PropertiesFile for preferences that belong to the machine, not the
 // session/preset (multi-core processing, the default A2 size for new
-// blocks). Same app-data root as PresetManager: ~/Library/Application
+// blocks, and the machine defaults for the calibration and oversampling
+// parameters). Same app-data root as PresetManager: ~/Library/Application
 // Support/TONE3000 on macOS, %APPDATA%/TONE3000 on Windows,
 // $XDG_CONFIG_HOME/TONE3000 (default ~/.config/TONE3000) on Linux.
 namespace {
 
 constexpr auto kMultiCoreKey = "multiCore";
 constexpr auto kNamSlimSizeDefaultKey = "namSlimSizeDefault";
-constexpr auto kWebInspectorKey = "webInspector";
+
+// Plugin Settings parameters that double as machine-wide defaults (see
+// Processor.h, isMachineDefaultParameter). Each is stored under its
+// parameter id.
+constexpr const char* kMachineDefaultParameterIds[] = {"calibrateInput", "inputCalibrationLevel",
+                                                       "osEnabled", "osFactor"};
+
+// Process-wide test switch for the constructor's seeding (see
+// disableMachineDefaultParametersForTesting).
+std::atomic<bool> machineDefaultParametersEnabled{true};
 
 // Magic prefix for the binary ValueTree state format (see getStateInformation).
 constexpr char kStateMagic[] = {'T', '3', 'K', 'B'};
@@ -37,7 +50,7 @@ juce::PropertiesFile::Options userSettingsOptions() {
 #if JUCE_LINUX || JUCE_BSD
   // PropertiesFile puts a bare folderName directly under ~ on Linux, so pass
   // the XDG config location as an absolute path instead (same root as
-  // PresetManager, the logs and the WebKit storage).
+  // PresetManager and the logs).
   options.folderName =
       juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
           .getChildFile("TONE3000")
@@ -48,10 +61,30 @@ juce::PropertiesFile::Options userSettingsOptions() {
   return options;
 }
 
+// Save now and say so when it fails: an unwritable app-data folder used to
+// make settings silently vanish on every relaunch, and the log's startup
+// snapshot ("exists=no" forever) was the only trace (github issue #76). The
+// constructor heals the folder (see ensureWritableDir); this keeps the
+// write itself honest.
+void saveSettingsOrLog(juce::PropertiesFile& settings) {
+  if (!settings.saveIfNeeded())
+    juce::Logger::writeToLog("[Processor] Couldn't write the settings file: " +
+                             settings.getFile().getFullPathName());
+}
+
 }  // namespace
 
 juce::File TONE3000Processor::getSettingsFile() {
   return userSettingsOptions().getDefaultFile();
+}
+
+juce::PropertiesFile::Options TONE3000Processor::uiPreferencesOptions() {
+  // Same folder as the shared settings, own file: the native UI's per-machine
+  // preferences get written by the editor on every toggle, and two
+  // PropertiesFile instances must never share a file.
+  auto options = userSettingsOptions();
+  options.applicationName = "ui-preferences";
+  return options;
 }
 
 bool TONE3000Processor::readPersistedMultiCoreEnabled() {
@@ -65,28 +98,6 @@ double TONE3000Processor::readPersistedNamSlimSizeDefault() {
       juce::PropertiesFile(userSettingsOptions()).getDoubleValue(kNamSlimSizeDefaultKey, 0.0));
 }
 
-bool TONE3000Processor::readPersistedWebInspectorEnabled() {
-  // Debug builds already get the inspector from stock JUCE; default on so a
-  // fresh debug install still has Inspect Element / Reload. Release stays off
-  // until Settings -> Diagnostics flips it.
-  return juce::PropertiesFile(userSettingsOptions())
-      .getBoolValue(kWebInspectorKey,
-#if JUCE_DEBUG
-                    true
-#else
-                    false
-#endif
-      );
-}
-
-void TONE3000Processor::persistWebInspectorEnabled(bool enabled) {
-  juce::PropertiesFile settings(userSettingsOptions());
-  settings.setValue(kWebInspectorKey, enabled);
-  settings.saveIfNeeded();
-  juce::Logger::writeToLog(juce::String("[Processor] Web Inspector ") +
-                           (enabled ? "enabled" : "disabled"));
-}
-
 void TONE3000Processor::setMultiCoreEnabled(bool enabled, bool persist) {
   if (multiCoreEnabled.load() == enabled)
     return;
@@ -97,7 +108,7 @@ void TONE3000Processor::setMultiCoreEnabled(bool enabled, bool persist) {
   if (persist) {
     juce::PropertiesFile settings(userSettingsOptions());
     settings.setValue(kMultiCoreKey, enabled);
-    settings.saveIfNeeded();
+    saveSettingsOrLog(settings);
   }
 
   juce::Logger::writeToLog(juce::String("[Processor] Multi-core processing ") +
@@ -114,10 +125,68 @@ void TONE3000Processor::setNamSlimSizeDefault(double slimSize) {
   namSlimSizeDefault.store(slimSize);
   juce::PropertiesFile settings(userSettingsOptions());
   settings.setValue(kNamSlimSizeDefaultKey, slimSize);
-  settings.saveIfNeeded();
+  saveSettingsOrLog(settings);
 
   juce::Logger::writeToLog("[Processor] Default NAM A2 size set to " + juce::String(slimSize));
   bumpChainRevision();
+}
+
+bool TONE3000Processor::isMachineDefaultParameter(const juce::String& paramId) {
+  for (const auto* id : kMachineDefaultParameterIds)
+    if (paramId == id)
+      return true;
+  return false;
+}
+
+void TONE3000Processor::disableMachineDefaultParametersForTesting() {
+  machineDefaultParametersEnabled.store(false);
+}
+
+void TONE3000Processor::writeMachineDefaultParameter(juce::PropertySet& settings,
+                                                     const juce::String& paramId) const {
+  auto* p = parameters.getParameter(paramId);
+  if (p == nullptr)
+    return;
+  settings.setValue(paramId, static_cast<double>(p->convertFrom0to1(p->getValue())));
+}
+
+void TONE3000Processor::applyMachineDefaultParameters(const juce::PropertySet& settings) {
+  juce::String applied;
+  for (const auto* id : kMachineDefaultParameterIds) {
+    if (!settings.containsKey(id))
+      continue;
+    auto* p = parameters.getParameter(id);
+    if (p == nullptr)
+      continue;
+    // Out-of-range file values (a hand edit, a future build's wider range)
+    // clamp to the parameter's own range through convertTo0to1.
+    const auto denormalised = static_cast<float>(settings.getDoubleValue(id));
+    p->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, p->convertTo0to1(denormalised)));
+    applied << (applied.isEmpty() ? "" : ", ") << id << "=" << settings.getValue(id);
+  }
+  if (applied.isNotEmpty())
+    juce::Logger::writeToLog("[Processor] Machine defaults applied: " + applied);
+}
+
+void TONE3000Processor::persistParameterAsMachineDefault(const juce::String& paramId) {
+  // Only the Settings-page set: a stray id here would turn a tone parameter
+  // into a machine-wide default.
+  if (!isMachineDefaultParameter(paramId)) {
+    jassertfalse;
+    return;
+  }
+  juce::PropertiesFile settings(userSettingsOptions());
+  writeMachineDefaultParameter(settings, paramId);
+  saveSettingsOrLog(settings);
+}
+
+void TONE3000Processor::seedMachineDefaultParameters() {
+  if (!machineDefaultParametersEnabled.load())
+    return;
+  // Nothing on disk yet: a fresh install runs on the parameter defaults.
+  if (!getSettingsFile().existsAsFile())
+    return;
+  applyMachineDefaultParameters(juce::PropertiesFile(userSettingsOptions()));
 }
 
 juce::ValueTree TONE3000Processor::serializeBlockSettings(const ChainBlock& block) {
@@ -298,7 +367,16 @@ void TONE3000Processor::setStateInformation(const void* data, int sizeInBytes) {
       juce::String(snapshot.getChildWithName("RightChainBlocks").getNumChildren()) +
       " right blocks)");
 
+  // Parameter ids an older build wrote are renamed in place before anything
+  // reads them (the tree is this call's own copy); the next save writes the
+  // current ids.
   juce::ValueTree parameterState = state.getChildWithName("PARAMETERS");
+  juce::ValueTree midiState = state.getChildWithName("MidiMappings");
+  if (const int renamed = t3k::legacy_ids::migrateParamIds(parameterState, "id") +
+                          t3k::legacy_ids::migrateParamIds(midiState, "targetId");
+      renamed > 0)
+    juce::Logger::writeToLog("[Restore] Renamed " + juce::String(renamed) + " legacy parameter ids");
+
   if (parameterState.isValid()) {
     parameters.replaceState(parameterState);
     DBG("Parameters restored from state");
@@ -315,7 +393,7 @@ void TONE3000Processor::setStateInformation(const void* data, int sizeInBytes) {
 
   // A missing child clears the map; a project without mappings must not
   // inherit the previous session's.
-  midiMapper.restoreFromValueTree(state.getChildWithName("MidiMappings"));
+  midiMapper.restoreFromValueTree(midiState);
 
   // A project load is a reconciling restore: matching blocks keep their
   // loaded engines, everything else decodes its embedded model bytes and

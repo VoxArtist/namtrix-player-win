@@ -17,8 +17,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
 endif()
 
 if(T3K_IOS)
-    # iOS 16 is the floor JUCE 9 / WKWebView / AVAudioSession are exercised
-    # against here, and covers every iPad that can run this at all.
+    # iOS 16 is the floor JUCE 9 / AVAudioSession are exercised against here,
+    # and covers every iPad that can run this at all.
     if(NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET OR CMAKE_OSX_DEPLOYMENT_TARGET STREQUAL "")
         set(CMAKE_OSX_DEPLOYMENT_TARGET "16.0" CACHE STRING "Minimum iOS version" FORCE)
     endif()
@@ -27,8 +27,7 @@ elseif(NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET OR CMAKE_OSX_DEPLOYMENT_TARGET ST
 endif()
 
 # Single source of truth for the plugin version (also read by
-# plugin/CMakeLists.txt, the packaging scripts and CI). Bump with
-# script/set-version.sh.
+# plugin/CMakeLists.txt, the packaging scripts and CI).
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" T3K_VERSION)
 string(STRIP "${T3K_VERSION}" T3K_VERSION)
 # Reconfigure automatically when the VERSION file changes.
@@ -65,47 +64,99 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 # Download CPM package manager
 include(cmake/cpm.cmake) 
 
+# Linux: FreeType is linked statically into every GUI binary instead of
+# resolved from the host at load time (issue #181). JUCE's juce_graphics
+# module asks pkg-config for the system `freetype2`, which makes the plugin
+# .so import FreeType by SONAME. That fails inside hosts that bundle their
+# own, older FreeType (the official Ardour / Mixbus builds ship a Debian-11
+# era libfreetype.so.6 in /opt/<host>/lib): the vendored HarfBuzz FreeType
+# glue in juce_graphics references the FreeType 2.13 COLRv1 API
+# (FT_Get_Paint & co) whenever the build host's headers are >= 2.13, lilv
+# opens LV2 libraries with RTLD_NOW, and the load dies with "undefined
+# symbol: FT_Get_Paint". (The VST3 only survives because Ardour opens it
+# RTLD_LAZY and no colour glyph is ever painted.) Pinning the library into
+# the binary removes the dependency on whatever FreeType a host happens to
+# carry, which is also what the Ardour maintainers require of plugins.
+#
+# Mechanism: JUCEModuleSupport's _juce_create_pkgconfig_target() returns
+# early when `juce::pkgconfig_<module>_LINUX_DEPS` already exists, so the
+# target is created here, before JUCE is added, as static FreeType plus the
+# pkg-config fontconfig JUCE would otherwise have pulled in alongside it
+# (fontconfig stays dynamic: it has to read the host's font configuration
+# and only old, stable Fc* entry points are used). Any freetype spill-over
+# from fontconfig's Requires.private is filtered out so neither the system
+# headers nor -lfreetype can reach the link. The library is built with no
+# external dependencies (internal zlib, no PNG/Brotli/bzip2/HarfBuzz: the
+# fonts are embedded TTFs), PIC so it links into the plugin modules, and
+# with FreeType's own hidden visibility so no FT_* symbol is exported from
+# our .so into the host process. 2.13.3 is the bug-fix successor of the
+# 2.13.2 the ubuntu-24.04 CI image was already building against, so glyph
+# rendering is unchanged. Desktop Linux only: HEADLESS builds take the
+# find_package(JUCE) route and macOS / Windows / iOS never touch FreeType.
+if (UNIX AND NOT APPLE AND NOT HEADLESS)
+    CPMAddPackage(
+        NAME freetype
+        GITHUB_REPOSITORY freetype/freetype
+        GIT_TAG VER-2-13-3
+        VERSION 2.13.3
+        SOURCE_DIR ${LIB_DIR}/freetype
+        EXCLUDE_FROM_ALL YES
+        OPTIONS
+            "FT_DISABLE_ZLIB ON"
+            "FT_DISABLE_BZIP2 ON"
+            "FT_DISABLE_PNG ON"
+            "FT_DISABLE_HARFBUZZ ON"
+            "FT_DISABLE_BROTLI ON"
+            "SKIP_INSTALL_ALL ON"
+    )
+    if (NOT TARGET freetype)
+        message(FATAL_ERROR "T3K_STATIC_FREETYPE: the freetype target was not created by "
+            "${LIB_DIR}/freetype; its CMake layout likely changed. Update the "
+            "package block in CMakeLists.txt.")
+    endif()
+    set_target_properties(freetype PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(T3K_FONTCONFIG REQUIRED fontconfig)
+    list(FILTER T3K_FONTCONFIG_LINK_LIBRARIES EXCLUDE REGEX "freetype")
+    list(FILTER T3K_FONTCONFIG_INCLUDE_DIRS EXCLUDE REGEX "freetype")
+
+    add_library(pkgconfig_juce_graphics_LINUX_DEPS INTERFACE)
+    add_library(juce::pkgconfig_juce_graphics_LINUX_DEPS ALIAS pkgconfig_juce_graphics_LINUX_DEPS)
+    target_link_libraries(pkgconfig_juce_graphics_LINUX_DEPS INTERFACE
+        freetype
+        ${T3K_FONTCONFIG_LINK_LIBRARIES})
+    target_include_directories(pkgconfig_juce_graphics_LINUX_DEPS INTERFACE
+        ${T3K_FONTCONFIG_INCLUDE_DIRS})
+    target_compile_options(pkgconfig_juce_graphics_LINUX_DEPS INTERFACE
+        ${T3K_FONTCONFIG_CFLAGS_OTHER})
+    # FreeType's own FT_EXPORT macro stamps every API function with
+    # visibility("default") (public-macros.h), overriding the hidden preset,
+    # so left alone the plugin .so would re-export all ~150 FT_* symbols as
+    # preemptible. In a host that already carries a FreeType, the dynamic
+    # linker resolves a dlopen'd library's preemptible references against the
+    # global scope first: our calls would bind to the host's copy for every
+    # symbol it has and to our own for the rest, mixing two implementations
+    # on one FT_Library. --exclude-libs makes the archive's symbols local in
+    # each binary that links it, so they are neither exported nor preempted.
+    target_link_options(pkgconfig_juce_graphics_LINUX_DEPS INTERFACE
+        ${T3K_FONTCONFIG_LDFLAGS_OTHER}
+        "LINKER:--exclude-libs,libfreetype.a")
+    message(STATUS "FreeType 2.13.3 linked statically into the Linux GUI targets (fontconfig stays dynamic)")
+endif()
+
 # Download JUCE using CPM
 CPMAddPackage(
     NAME JUCE
-    GIT_TAG 9.0.1
-    VERSION 9.0.1
+    GIT_TAG 9.0.3
+    VERSION 9.0.3
     GITHUB_REPOSITORY juce-framework/JUCE
     SOURCE_DIR ${LIB_DIR}/juce
 )
 
-# The macOS WKWebView Web Inspector is no longer force-enabled at build time.
-# Debug builds get it from stock JUCE (gated on JUCE_DEBUG); release builds
-# expose it behind the Web Inspector toggle in Settings -> Diagnostics, applied
-# at runtime (see EditorWebViewSetup::setWebInspectorEnabled). A previously
-# patched JUCE copy in libs/ is harmless: its added gate rides an undefined
-# macro (T3K_ENABLE_DEVTOOLS) and compiles back to stock behavior.
-
-# macOS: WKWebView paints an opaque white background until the first page paint,
-# which shows as a white flash when the editor opens. JUCE (still true in 9.0.1)
-# only exposes a background-colour option for Windows (WinWebView2), so patch the WKWebView to
-# not draw its own background; the editor's black paint() shows through instead.
-# Idempotent configure-time patch, same rationale as the devtools patch above.
-if (APPLE)
-    set(_juce_webview_mm "${LIB_DIR}/juce/modules/juce_gui_extra/native/juce_WebBrowserComponent_mac.mm")
-    if (EXISTS "${_juce_webview_mm}")
-        file(READ "${_juce_webview_mm}" _juce_webview_src)
-        if (NOT _juce_webview_src MATCHES "T3K_WEBVIEW_NO_FLASH")
-            string(REGEX REPLACE
-                "\n([ \t]*)\\[webView\\.get\\(\\) setNavigationDelegate: webViewDelegate\\.get\\(\\)\\];"
-                "\n       #if JUCE_MAC\n        // T3K_WEBVIEW_NO_FLASH: transparent until first page paint (kills the white flash)\n        [webView.get() setValue: @(NO) forKey: @\"drawsBackground\"];\n       #endif\n\n\\1[webView.get() setNavigationDelegate: webViewDelegate.get()];"
-                _juce_webview_src "${_juce_webview_src}")
-            if (NOT _juce_webview_src MATCHES "T3K_WEBVIEW_NO_FLASH")
-                message(FATAL_ERROR
-                    "T3K_WEBVIEW_NO_FLASH: failed to patch ${_juce_webview_mm}. "
-                    "The JUCE source layout likely changed in this version. Update the patch "
-                    "anchor in CMakeLists.txt.")
-            endif()
-            file(WRITE "${_juce_webview_mm}" "${_juce_webview_src}")
-            message(STATUS "Patched JUCE WebBrowserComponent: WKWebView background disabled (no white flash)")
-        endif()
-    endif()
-endif()
+# JUCE source patches (idempotent, configure time; JUCE lives in the
+# gitignored libs/). Each one is anchored on a T3K_* marker so a re-run is a
+# no-op, and fails loudly when the JUCE layout moves under it.
 
 # macOS: when Thread::startRealtimeThread's time-constraint upgrade is
 # rejected by the kernel (thread_policy_set fails, e.g. for very long
@@ -152,159 +203,11 @@ if (EXISTS "${_juce_threads_mac}")
     endif()
 endif()
 
-# Linux: JUCE dlopens WebKitGTK/GTK by their UNVERSIONED .so names
-# (libwebkit2gtk-4.1.so etc.), but distros only ship those symlinks in the
-# -dev packages; end-user systems have only the versioned SONAMEs
-# (libwebkit2gtk-4.1.so.0). The dlopen fails silently, webKitIsAvailable
-# stays false, every webview call becomes a no-op, and the plugin renders a
-# black screen. Patch the names to the upstream SONAMEs, which exist on every
-# install (the -dev packages depend on the runtime libs, so this covers both).
-# Idempotent configure-time patch, same rationale as the macOS patches above.
-# Applied on every platform (the file only compiles on Linux; patching it
-# elsewhere is harmless and keeps the libs/juce tree identical everywhere).
-set(_juce_webview_linux "${LIB_DIR}/juce/modules/juce_gui_extra/native/juce_WebBrowserComponent_linux.cpp")
-if (EXISTS "${_juce_webview_linux}")
-    file(READ "${_juce_webview_linux}" _juce_webview_linux_src)
-    if (NOT _juce_webview_linux_src MATCHES "T3K_WEBKIT_SONAME")
-        string(REPLACE "\"libwebkit2gtk-4.1.so\""        "\"libwebkit2gtk-4.1.so.0\""         _juce_webview_linux_src "${_juce_webview_linux_src}")
-        string(REPLACE "\"libjavascriptcoregtk-4.1.so\"" "\"libjavascriptcoregtk-4.1.so.0\""  _juce_webview_linux_src "${_juce_webview_linux_src}")
-        string(REPLACE "\"libsoup-3.0.so\""              "\"libsoup-3.0.so.0\""               _juce_webview_linux_src "${_juce_webview_linux_src}")
-        string(REPLACE "\"libwebkit2gtk-4.0.so\""        "\"libwebkit2gtk-4.0.so.37\""        _juce_webview_linux_src "${_juce_webview_linux_src}")
-        string(REPLACE "\"libjavascriptcoregtk-4.0.so\"" "\"libjavascriptcoregtk-4.0.so.18\"" _juce_webview_linux_src "${_juce_webview_linux_src}")
-        string(REPLACE "\"libsoup-2.4.so\""              "\"libsoup-2.4.so.1\""               _juce_webview_linux_src "${_juce_webview_linux_src}")
-        string(REPLACE "\"libgtk-3.so\""                 "\"libgtk-3.so.0\""                  _juce_webview_linux_src "${_juce_webview_linux_src}")
-        string(REPLACE "\"libglib-2.0.so\""              "\"libglib-2.0.so.0\" /* T3K_WEBKIT_SONAME */" _juce_webview_linux_src "${_juce_webview_linux_src}")
-        if (NOT _juce_webview_linux_src MATCHES "T3K_WEBKIT_SONAME")
-            message(FATAL_ERROR
-                "T3K_WEBKIT_SONAME: failed to patch ${_juce_webview_linux}. "
-                "The JUCE source layout likely changed in this version. Update the patch "
-                "anchors in CMakeLists.txt.")
-        endif()
-        file(WRITE "${_juce_webview_linux}" "${_juce_webview_linux_src}")
-        message(STATUS "Patched JUCE WebBrowserComponent: WebKitGTK loaded by SONAME (works without -dev packages)")
-    endif()
-endif()
-
-# Linux: JUCE builds its WebKitGTK view on the DEFAULT WebKitWebContext, which
-# breaks login persistence two ways: (1) the default website-data location is
-# derived from the process name, and for plugin (non-standalone) builds JUCE
-# extracts the webview subprocess to a RANDOMLY-NAMED temp file, so
-# localStorage lands in a different directory every session; (2) WebKitGTK
-# keeps cookies in memory only unless webkit_cookie_manager_set_persistent_storage()
-# is called, which JUCE never does, so the tone3000.com OAuth session dies
-# with the process even in the standalone. Patch the subprocess to build its
-# context on an explicit WebKitWebsiteDataManager rooted at
-# ~/.config/TONE3000/WebKit (the same app-data root as presets/logs) and turn
-# on SQLite cookie persistence. All added symbols are dlopened like the rest
-# (present in every WebKitGTK 4.0/4.1 since 2.10). Idempotent configure-time
-# patch, same rationale and platform note as the SONAME patch above.
-if (EXISTS "${_juce_webview_linux}")
-    file(READ "${_juce_webview_linux}" _juce_webview_linux_src)
-    if (NOT _juce_webview_linux_src MATCHES "T3K_WEBKIT_PERSISTENT_STORAGE")
-        # 1) Declare the extra WebKit functions (typed pointers + no-op defaults).
-        string(REPLACE
-[=[    JUCE_GENERATE_FUNCTION_WITH_DEFAULT (webkit_web_view_new_with_settings, juce_webkit_web_view_new_with_settings,
-                                         (WebKitSettings*), GtkWidget*)]=]
-[=[    JUCE_GENERATE_FUNCTION_WITH_DEFAULT (webkit_web_view_new_with_settings, juce_webkit_web_view_new_with_settings,
-                                         (WebKitSettings*), GtkWidget*)
-
-    // T3K_WEBKIT_PERSISTENT_STORAGE: build the view on an explicit context so
-    // localStorage/cookies live at a stable path instead of the process-name
-    // derived default (random for plugin subprocesses, memory-only cookies).
-    // webkit_website_data_manager_new is variadic, which the macro's default
-    // lambda cannot express (a variadic lambda cannot convert to a variadic
-    // function pointer on clang), so it is declared by hand with a plain
-    // function as the pre-load default.
-    static WebKitWebsiteDataManager* juce_webkit_website_data_manager_new_default (const gchar*, ...) { return nullptr; }
-    using webkit_website_data_manager_new = WebKitWebsiteDataManager* (*) (const gchar*, ...);
-    webkit_website_data_manager_new juce_webkit_website_data_manager_new = &juce_webkit_website_data_manager_new_default;
-
-    JUCE_GENERATE_FUNCTION_WITH_DEFAULT (webkit_web_context_new_with_website_data_manager, juce_webkit_web_context_new_with_website_data_manager,
-                                         (WebKitWebsiteDataManager*), WebKitWebContext*)
-
-    JUCE_GENERATE_FUNCTION_WITH_DEFAULT (webkit_web_context_get_cookie_manager, juce_webkit_web_context_get_cookie_manager,
-                                         (WebKitWebContext*), WebKitCookieManager*)
-
-    JUCE_GENERATE_FUNCTION_WITH_DEFAULT (webkit_cookie_manager_set_persistent_storage, juce_webkit_cookie_manager_set_persistent_storage,
-                                         (WebKitCookieManager*, const gchar*, WebKitCookiePersistentStorage), void)
-
-    JUCE_GENERATE_FUNCTION_WITH_DEFAULT (webkit_web_view_new_with_context, juce_webkit_web_view_new_with_context,
-                                         (WebKitWebContext*), GtkWidget*)
-
-    JUCE_GENERATE_FUNCTION_WITH_DEFAULT (webkit_web_view_set_settings, juce_webkit_web_view_set_settings,
-                                         (WebKitWebView*, WebKitSettings*), void)]=]
-            _juce_webview_linux_src "${_juce_webview_linux_src}")
-        if (NOT _juce_webview_linux_src MATCHES "juce_webkit_website_data_manager_new")
-            message(FATAL_ERROR
-                "T3K_WEBKIT_PERSISTENT_STORAGE: failed to patch symbol declarations in ${_juce_webview_linux}. "
-                "The JUCE source layout likely changed in this version. Update the patch anchors in CMakeLists.txt.")
-        endif()
-
-        # 2) dlopen bindings for the new symbols.
-        string(REPLACE
-[=[                            makeSymbolBinding (juce_webkit_web_view_new_with_settings,                           "webkit_web_view_new_with_settings"),]=]
-[=[                            makeSymbolBinding (juce_webkit_web_view_new_with_settings,                           "webkit_web_view_new_with_settings"),
-                            // T3K_WEBKIT_PERSISTENT_STORAGE
-                            makeSymbolBinding (juce_webkit_website_data_manager_new,                             "webkit_website_data_manager_new"),
-                            makeSymbolBinding (juce_webkit_web_context_new_with_website_data_manager,            "webkit_web_context_new_with_website_data_manager"),
-                            makeSymbolBinding (juce_webkit_web_context_get_cookie_manager,                       "webkit_web_context_get_cookie_manager"),
-                            makeSymbolBinding (juce_webkit_cookie_manager_set_persistent_storage,                "webkit_cookie_manager_set_persistent_storage"),
-                            makeSymbolBinding (juce_webkit_web_view_new_with_context,                            "webkit_web_view_new_with_context"),
-                            makeSymbolBinding (juce_webkit_web_view_set_settings,                                "webkit_web_view_set_settings"),]=]
-            _juce_webview_linux_src "${_juce_webview_linux_src}")
-        if (NOT _juce_webview_linux_src MATCHES "\"webkit_web_view_new_with_context\"")
-            message(FATAL_ERROR
-                "T3K_WEBKIT_PERSISTENT_STORAGE: failed to patch symbol bindings in ${_juce_webview_linux}. "
-                "The JUCE source layout likely changed in this version. Update the patch anchors in CMakeLists.txt.")
-        endif()
-
-        # 3) Create the web view on the persistent context.
-        string(REPLACE
-[=[        auto* webviewWidget = WebKitSymbols::getInstance()->juce_webkit_web_view_new_with_settings (settings);
-        webview = (WebKitWebView*) webviewWidget;]=]
-[=[        // T3K_WEBKIT_PERSISTENT_STORAGE: stable per-user storage for
-        // localStorage (OAuth tokens) and cookies (tone3000.com session).
-        const auto t3kStorageRoot = File::getSpecialLocation (File::userApplicationDataDirectory)
-                                        .getChildFile ("TONE3000")
-                                        .getChildFile ("WebKit");
-        const auto t3kDataDir  = t3kStorageRoot.getChildFile ("data");
-        const auto t3kCacheDir = t3kStorageRoot.getChildFile ("cache");
-        t3kDataDir.createDirectory();
-        t3kCacheDir.createDirectory();
-
-        auto* t3kDataManager = wk.juce_webkit_website_data_manager_new (
-            "base-data-directory",  t3kDataDir .getFullPathName().toRawUTF8(),
-            "base-cache-directory", t3kCacheDir.getFullPathName().toRawUTF8(),
-            nullptr);
-
-        auto* t3kContext = wk.juce_webkit_web_context_new_with_website_data_manager (t3kDataManager);
-
-        static constexpr int webkitCookiePersistentStorageSqliteFlag = 1;
-        wk.juce_webkit_cookie_manager_set_persistent_storage (
-            wk.juce_webkit_web_context_get_cookie_manager (t3kContext),
-            t3kDataDir.getChildFile ("cookies.sqlite").getFullPathName().toRawUTF8(),
-            (WebKitCookiePersistentStorage) webkitCookiePersistentStorageSqliteFlag);
-
-        auto* webviewWidget = wk.juce_webkit_web_view_new_with_context (t3kContext);
-        wk.juce_webkit_web_view_set_settings ((WebKitWebView*) webviewWidget, settings);
-        webview = (WebKitWebView*) webviewWidget;]=]
-            _juce_webview_linux_src "${_juce_webview_linux_src}")
-        if (NOT _juce_webview_linux_src MATCHES "t3kStorageRoot")
-            message(FATAL_ERROR
-                "T3K_WEBKIT_PERSISTENT_STORAGE: failed to patch web view creation in ${_juce_webview_linux}. "
-                "The JUCE source layout likely changed in this version. Update the patch anchors in CMakeLists.txt.")
-        endif()
-
-        file(WRITE "${_juce_webview_linux}" "${_juce_webview_linux_src}")
-        message(STATUS "Patched JUCE WebBrowserComponent: WebKitGTK persistent storage (login survives restarts)")
-    endif()
-endif()
-
 # StandaloneFilterWindow patches (idempotent; JUCE lives in gitignored libs/).
 #
 # T3K_NO_MUTE_BANNER: never show JUCE's native "Audio input is muted" strip.
-# The plugin surfaces mute/feedback state in its own web UI (AppBanner); the
-# native bar would double up and fight over window height.
+# The plugin surfaces mute/feedback state in its own AppBanner; the native
+# bar would double up and fight over window height.
 #
 # T3K_DARK_MUTE_BANNER: leftover restyle of that strip (kept so a missed hide
 # patch doesn't flash the stock lightgoldenrodyellow bar). Harmless when hidden.
@@ -334,7 +237,7 @@ if (EXISTS "${_juce_standalone_h}")
 "        void inputMutedChanged (bool newInputMutedValue)
         {
             // T3K_NO_MUTE_BANNER: the muted-input state is surfaced by the
-            // plugin's own web UI banner (see AppBanner \"auto-muted\"), which
+            // plugin's own AppBanner (\"input-muted\"), which
             // grows the window instead of overlaying the editor. Never show
             // JUCE's native strip so the two can't double up or fight over
             // the window height.
@@ -455,7 +358,7 @@ endif()
 # ~/Library/Application Support on macOS; Windows already resolves to
 # %APPDATA%/TONE3000 and is unchanged). Linux resolves through
 # userApplicationDataDirectory so XDG_CONFIG_HOME is honoured, the same root
-# as presets, logs and the WebKit storage. The processor's own machine-wide
+# as presets and logs. The processor's own machine-wide
 # store in the same folder is named preferences.settings (see
 # ProcessorState.cpp), so the two files cannot collide. Idempotent
 # configure-time patch, same rationale as the patches above.
@@ -501,102 +404,50 @@ if (EXISTS "${_juce_standalone_cpp}")
     endif()
 endif()
 
-# T3K_AUDIO_DEFAULT_SETUP: fix a JUCE 9 regression in
-# AudioDeviceManager::setAudioDeviceSetup. JUCE 8 treated an unset (0) sample
-# rate / buffer size as "use the device defaults" (chooseBestSampleRate /
-# chooseBestBufferSize). JUCE 9.0.1 replaced both with
-# findNearestValue(available, requested), and nearest-to-0 is the device
-# MINIMUM: switching devices with a zeroed setup (our
-# StandaloneAudioSettings::setDevice, and JUCE's own first-boot initialise)
-# opens e.g. a Focusrite on ALSA at 44.1 kHz with a 16-sample period, which
-# the DSP chain cannot survive (observed as a segfault on device pick on
-# Linux). Restore the JUCE 8 semantics for unset values; explicit requests
-# keep JUCE 9's nearest-supported clamping. Also passes the resolved sample
-# rate (not the raw, possibly-0 request) to the post-open buffer-size
-# correction, which stock JUCE 9 gets wrong too. Idempotent configure-time
-# patch, same rationale as the patches above. Cross-platform file, so this
-# applies everywhere. Drop when upstream fixes it.
+# T3K_AUDIO_DEFAULT_SETUP: the default sample rate for an unset (0) request
+# in AudioDeviceManager::setAudioDeviceSetup. JUCE 9.0.3 resolves a 0 rate /
+# buffer to device defaults again (9.0.1 fed the 0 to findNearestValue and
+# opened at the device minimum, a 16-sample ALSA period the chain could not
+# survive), but its default rate is "whatever the device is at now, else
+# 44.1 kHz", and that "current" rate is taken on trust. A device that is
+# not yet open, or reports a rate outside its own list, then lands wherever
+# findNearestValue(44100) falls, which can be below 44.1 kHz. Prefer the
+# lowest rate at or above 44.1 kHz instead, falling back to nearest 48 kHz
+# (the rate the chains run at); the buffer default is the device's own, as
+# upstream. Idempotent configure-time patch, same rationale as the patches
+# above. Cross-platform file, so this applies everywhere.
 set(_juce_adm_cpp "${LIB_DIR}/juce/modules/juce_audio_devices/audio_io/juce_AudioDeviceManager.cpp")
 if (EXISTS "${_juce_adm_cpp}")
     file(READ "${_juce_adm_cpp}" _juce_adm_src)
     if (NOT _juce_adm_src MATCHES "T3K_AUDIO_DEFAULT_SETUP")
         set(_juce_adm_old
-[=[    const auto sampleRate = findNearestValue (Span { currentAudioDevice->getAvailableSampleRates() }, currentSetup.sampleRate);
-    const auto preBufferSize = findNearestValue (Span { currentAudioDevice->getAvailableBufferSizes() }, currentSetup.bufferSize);
+[=[static double getDefaultRequestedSampleRate (AudioIODevice& device)
+{
+    if (const auto current = device.getCurrentSampleRate(); current > 0.0)
+        return current;
 
-    error = currentAudioDevice->open (currentSetup.inputChannels,
-                                      currentSetup.outputChannels,
-                                      sampleRate,
-                                      preBufferSize);
-
-    if (error.isEmpty())
-    {
-        // The available buffer sizes may have changed, if the sample rate has
-        // changed. If so we'll need to reconfigure with a different buffer size.
-        const auto postBufferSize = findNearestValue (Span { currentAudioDevice->getAvailableBufferSizes() }, currentSetup.bufferSize);
-
-        if (preBufferSize != postBufferSize)
-        {
-            error = currentAudioDevice->open (currentSetup.inputChannels,
-                                              currentSetup.outputChannels,
-                                              currentSetup.sampleRate,
-                                              postBufferSize);
-        }
-    }]=])
+    return 44100.0;
+}]=])
         set(_juce_adm_new
-[=[    // T3K_AUDIO_DEFAULT_SETUP: an unset (0) rate/buffer request must mean
-    // "device defaults" (JUCE 8 semantics), never findNearestValue's
-    // nearest-to-0, which is the device minimum (16-sample ALSA periods).
-    const auto t3kResolveSampleRate = [this]
-    {
-        if (currentSetup.sampleRate > 0)
-            return findNearestValue (Span { currentAudioDevice->getAvailableSampleRates() }, currentSetup.sampleRate);
+[=[static double getDefaultRequestedSampleRate (AudioIODevice& device)
+{
+    // T3K_AUDIO_DEFAULT_SETUP: only trust the current rate when the device
+    // lists it; otherwise the lowest rate at or above 44.1 kHz, else the
+    // caller's findNearestValue settles 48 kHz to the closest available.
+    const auto rates = device.getAvailableSampleRates();
 
-        const auto rates = currentAudioDevice->getAvailableSampleRates();
+    if (const auto current = device.getCurrentSampleRate();
+        current > 0.0 && rates.contains (current))
+        return current;
 
-        if (const auto current = currentAudioDevice->getCurrentSampleRate();
-            current > 0 && rates.contains (current))
-            return current;
+    double lowestAbove44 = 0.0;
 
-        double lowestAbove44 = 0.0;
+    for (const auto sr : rates)
+        if (sr >= 44100.0 && (lowestAbove44 < 1.0 || sr < lowestAbove44))
+            lowestAbove44 = sr;
 
-        for (const auto sr : rates)
-            if (sr >= 44100.0 && (lowestAbove44 < 1.0 || sr < lowestAbove44))
-                lowestAbove44 = sr;
-
-        return lowestAbove44 > 0.0 ? lowestAbove44
-                                   : findNearestValue (Span { rates }, 48000.0);
-    };
-
-    const auto t3kResolveBufferSize = [this]
-    {
-        return currentSetup.bufferSize > 0
-             ? findNearestValue (Span { currentAudioDevice->getAvailableBufferSizes() }, currentSetup.bufferSize)
-             : currentAudioDevice->getDefaultBufferSize();
-    };
-
-    const auto sampleRate = t3kResolveSampleRate();
-    const auto preBufferSize = t3kResolveBufferSize();
-
-    error = currentAudioDevice->open (currentSetup.inputChannels,
-                                      currentSetup.outputChannels,
-                                      sampleRate,
-                                      preBufferSize);
-
-    if (error.isEmpty())
-    {
-        // The available buffer sizes may have changed, if the sample rate has
-        // changed. If so we'll need to reconfigure with a different buffer size.
-        const auto postBufferSize = t3kResolveBufferSize();
-
-        if (preBufferSize != postBufferSize)
-        {
-            error = currentAudioDevice->open (currentSetup.inputChannels,
-                                              currentSetup.outputChannels,
-                                              sampleRate,
-                                              postBufferSize);
-        }
-    }]=])
+    return lowestAbove44 > 0.0 ? lowestAbove44 : 48000.0;
+}]=])
         string(REPLACE "${_juce_adm_old}" "${_juce_adm_new}" _juce_adm_src "${_juce_adm_src}")
         if (NOT _juce_adm_src MATCHES "T3K_AUDIO_DEFAULT_SETUP")
             message(FATAL_ERROR
@@ -605,7 +456,7 @@ if (EXISTS "${_juce_adm_cpp}")
                 "anchors in CMakeLists.txt.")
         endif()
         file(WRITE "${_juce_adm_cpp}" "${_juce_adm_src}")
-        message(STATUS "Patched JUCE AudioDeviceManager: unset rate/buffer requests use device defaults, not device minimum")
+        message(STATUS "Patched JUCE AudioDeviceManager: unset sample rate request prefers 44.1 kHz and up, then 48 kHz")
     endif()
 endif()
 
@@ -656,79 +507,15 @@ if (EXISTS "${_juce_alsa_cpp}")
     endif()
 endif()
 
-# T3K_ALSA_INPUT_CHANS_SYNC: ALSAThread::open() fills currentInputChans and
-# inputChannelDataForCallback together in one loop over the *requested* input
-# mask, then widens currentInputChans alone (ensureMinimumNumBitsSet) up to
-# the hardware's channel-count floor afterward - so on a device whose floor
-# is above the request (e.g. fixed at 2 channels, request is 1), the bitset
-# getActiveInputChannels() reports gains a bit with no matching entry in
-# inputChannelDataForCallback. AudioDeviceManager's CallbackMaxSizeEnforcer
-# sizes its stored channel vectors from that (now too-wide) bitset, fills in
-# only the channels the real callback array actually has, and forwards the
-# rest as null/stale pointers - which is what then reads out of bounds
-# reliably on any device reconfiguration. Confirmed live with gdb: the input
-# open genuinely hands the callback exactly 1 channel pointer while
-# getActiveInputChannels() still reports 2. Fix from upstream JUCE PR
-# https://github.com/juce-framework/JUCE/pull/1706 (unmerged as of this
-# writing) - widen the *request* before the fill loop, so the bitset and the
-# channel array agree by construction; drop this patch once it lands.
-# Idempotent configure-time patch, same rationale as the patches above.
-set(_juce_alsa_cpp2 "${LIB_DIR}/juce/modules/juce_audio_devices/native/juce_ALSA_linux.cpp")
-if (EXISTS "${_juce_alsa_cpp2}")
-    file(READ "${_juce_alsa_cpp2}" _juce_alsa_src2)
-    if (NOT _juce_alsa_src2 MATCHES "T3K_ALSA_INPUT_CHANS_SYNC")
-        set(_juce_alsa_old2
-[=[        error.clear();
-        sampleRate = newSampleRate;
-        bufferSize = newBufferSize;
-
-        int maxInputsRequested = inputChannels.getHighestBit() + 1;]=])
-        set(_juce_alsa_new2
-[=[        error.clear();
-        sampleRate = newSampleRate;
-        bufferSize = newBufferSize;
-
-        // T3K_ALSA_INPUT_CHANS_SYNC: widen the *request* before the fill loop
-        // below builds currentInputChans and inputChannelDataForCallback
-        // together, so the two stay in agreement (matches the output path a
-        // few lines below, which already widens before its own fill loop). A
-        // request for no input channels at all is left alone rather than
-        // being widened to the minimum.
-        if (inputChannels.getHighestBit() >= 0)
-            ensureMinimumNumBitsSet (inputChannels, (int) minChansIn);
-
-        int maxInputsRequested = inputChannels.getHighestBit() + 1;]=])
-        string(REPLACE "${_juce_alsa_old2}" "${_juce_alsa_new2}" _juce_alsa_src2 "${_juce_alsa_src2}")
-
-        # The widening used to happen here, after the fill loop; it's now done
-        # to the request before the loop runs instead, so drop the old call.
-        set(_juce_alsa_old2b
-[=[            ensureMinimumNumBitsSet (currentInputChans, (int) minChansIn);
-
-            if (! inputDevice->setParameters ((unsigned int) sampleRate,]=])
-        set(_juce_alsa_new2b
-[=[            if (! inputDevice->setParameters ((unsigned int) sampleRate,]=])
-        string(REPLACE "${_juce_alsa_old2b}" "${_juce_alsa_new2b}" _juce_alsa_src2 "${_juce_alsa_src2}")
-
-        if (NOT _juce_alsa_src2 MATCHES "T3K_ALSA_INPUT_CHANS_SYNC")
-            message(FATAL_ERROR
-                "T3K_ALSA_INPUT_CHANS_SYNC: failed to patch ${_juce_alsa_cpp2}. "
-                "The JUCE source layout likely changed in this version. Update the patch "
-                "anchors in CMakeLists.txt.")
-        endif()
-        file(WRITE "${_juce_alsa_cpp2}" "${_juce_alsa_src2}")
-        message(STATUS "Patched JUCE ALSAThread: widen the input channel request before the callback-array fill loop")
-    endif()
-endif()
-
 # T3K_CALLBACK_ENFORCER_NULL_SAFE: CallbackMaxSizeEnforcer sizes its stored
 # channel vectors from the device's active-channel bitsets in
 # audioDeviceAboutToStart, but only fills in the number of channels the
 # device actually passes to each callback, then forwards the *vector's full
 # size* to the inner callback (AudioProcessorPlayer) regardless. If a
-# device's bitsets and channel counts ever disagree - which they can even
-# with T3K_ALSA_INPUT_CHANS_SYNC applied, for any other AudioIODevice
-# backend with the same class of mismatch - the tail of those vectors still
+# device's bitsets and channel counts ever disagree - JUCE 9.0.3 fixed the
+# ALSA case (the input request is widened to the hardware floor before the
+# callback array is built), but any other AudioIODevice backend with the
+# same class of mismatch is still exposed - the tail of those vectors still
 # holds the null pointers std::vector::resize() default-constructed, and
 # gets forwarded as if they were real channels: AudioProcessorPlayer memcpys
 # from them unconditionally, and LevelMeter::updateLevel dereferences them
@@ -928,8 +715,8 @@ endif()
 # height of INT_MAX. Mutter-family window managers (Muffin on Mint, Mutter on
 # GNOME) add the frame border back onto those hints, overflow int, and clamp
 # the window to the PMinSize floor instead: the window maps at full width but
-# 1px high, showing only its title bar, and the WebKitGTK view (still
-# full-size, but clipped inside the 1px parent) never becomes visible.
+# 1px high, showing only its title bar, and the editor (still full-size,
+# but clipped inside the 1px parent) never becomes visible.
 # Clamp the published hints to a bound no real display can reach (1e7 px) so
 # WM-side arithmetic stays finite; genuine limits (this editor publishes
 # 1x..2x of its design box) pass through unchanged. Computing in doubles also
@@ -997,4 +784,5 @@ add_subdirectory(plugin) # Add plugin project
 # for iOS produces something that cannot be run, so keep it out of that build.
 if (NOT T3K_IOS)
     add_subdirectory(test)   # DSP test suite (DspTests, see script/test-dsp.sh)
+    add_subdirectory(tools)  # maintainer utilities (PresetTool), EXCLUDE_FROM_ALL
 endif()
