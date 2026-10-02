@@ -54,6 +54,9 @@ public:
   void setStereoMode(bool enabled);
   void setInputMode(InputMode mode);
   bool setBlockSlimSize(const std::string& blockId, double slimSize);
+  // One knob of a parametric model. Fire-and-forget like setBlockParam: the
+  // knob keeps its optimistic value and the chain resync confirms it.
+  void setBlockNamParam(const std::string& blockId, int index, double value);
   void setNamSlimSizeDefault(double slimSize);
   void setMultiCore(bool enabled);
   void setActiveSide(ChainSide side);

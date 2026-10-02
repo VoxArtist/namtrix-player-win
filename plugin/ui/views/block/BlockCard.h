@@ -34,6 +34,7 @@
 #include "widgets/Knob.h"
 #include "widgets/LoadingDots.h"
 #include "widgets/ModelSelect.h"
+#include "widgets/NamParamKnobs.h"
 #include "widgets/RetryLoadBadge.h"
 #include "widgets/SegmentedText.h"
 #include "widgets/ToneImage.h"
@@ -140,6 +141,9 @@ private:
   LoadingDots loading_;
   RetryLoadBadge retry_;
   ToneMeta meta_;
+  // Knobs a parametric model declares for itself. Always constructed; builds
+  // empty (and lays out to zero height) for a snapshot model.
+  std::unique_ptr<NamParamKnobs> namKnobs_;
   juce::Component selectWrap_;
   ModelSelect select_;
   BusyOverlay infoBusy_{BusyOverlay::Align::centre};

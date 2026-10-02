@@ -117,6 +117,10 @@ bool ProcessorBackend::setBlockParam(const std::string& blockId, const juce::Str
 bool ProcessorBackend::setBlockSlimSize(const std::string& blockId, double slimSize) {
   return processor_.setBlockSlimSize(blockId, slimSize);
 }
+
+bool ProcessorBackend::setBlockNamParam(const std::string& blockId, int index, double value) {
+  return processor_.setBlockNamParam(blockId, index, value);
+}
 bool ProcessorBackend::setBlockEqBand(const std::string& blockId, int bandIndex,
                                       const juce::var& band) {
   return band.isObject() && processor_.setBlockEqBand(blockId, bandIndex, band);

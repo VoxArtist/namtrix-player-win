@@ -75,6 +75,10 @@ public:
   // Per-block params / EQ / spectrum
   virtual bool setBlockParam(const std::string& blockId, const juce::String& param, double value) = 0;
   virtual bool setBlockSlimSize(const std::string& blockId, double slimSize) = 0;
+  // One knob of a parametric NAM model, by its index into the block's
+  // namParamSpecs. `value` is in the knob's own units; native clamps it to the
+  // spec and rounds switches to a whole index.
+  virtual bool setBlockNamParam(const std::string& blockId, int index, double value) = 0;
   virtual bool setBlockEqBand(const std::string& blockId, int bandIndex, const juce::var& band) = 0;
   virtual bool setBlockEqEnabled(const std::string& blockId, bool enabled) = 0;
   virtual bool setBlockEqPre(const std::string& blockId, bool pre) = 0;

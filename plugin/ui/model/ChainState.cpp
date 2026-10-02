@@ -95,7 +95,23 @@ BlockParams parseParams(const juce::var& v) {
   p.eq.enabled = boolean(eq, "enabled", false);
   p.eq.pre = boolean(eq, "pre", false);
   p.eq.bands = list<EqBand>(eq, "bands", parseBand);
+  if (const auto* values = v["namParamValues"].getArray())
+    for (const auto& value : *values)
+      p.namParamValues.push_back(static_cast<float>(static_cast<double>(value)));
   return p;
+}
+
+NamParamSpec parseNamParamSpec(const juce::var& v) {
+  NamParamSpec spec;
+  spec.name = str(v, "name");
+  spec.min = static_cast<float>(num(v, "min", 0));
+  spec.max = static_cast<float>(num(v, "max", 1));
+  spec.defaultValue = static_cast<float>(num(v, "default", 0));
+  spec.type = str(v, "type", "continuous");
+  if (const auto* names = v["enumNames"].getArray())
+    for (const auto& name : *names)
+      spec.enumNames.add(name.toString());
+  return spec;
 }
 
 ToneSummary parseTone(const juce::var& v) {
@@ -136,6 +152,7 @@ ChainItem parseItem(const juce::var& v) {
   item.irLong = boolean(v, "irLong", false);
   item.inputLevelDbu = optNum(v, "inputLevelDbu");
   item.outputLevelDbu = optNum(v, "outputLevelDbu");
+  item.namParamSpecs = list<NamParamSpec>(v, "namParamSpecs", parseNamParamSpec);
   item.params = parseParams(v["params"]);
   return item;
 }

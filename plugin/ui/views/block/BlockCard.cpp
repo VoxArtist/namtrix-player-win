@@ -202,6 +202,9 @@ void BlockCard::buildBody() {
   meta_.info().onOpenUrl = [](const juce::String& url) { juce::URL(url).launchInDefaultBrowser(); };
   body_.addAndMakeVisible(meta_);
 
+  namKnobs_ = std::make_unique<NamParamKnobs>(services_.chain, block_.blockId);
+  body_.addAndMakeVisible(*namKnobs_);
+
   select_.onChange = [this](const juce::String& id) { switchModel(id); };
   // Opening retries a failed list fetch, so a transient failure never sticks.
   select_.onOpen = [this] {
@@ -350,6 +353,8 @@ void BlockCard::syncHeader() {
 }
 
 void BlockCard::syncMeta() {
+  if (namKnobs_ != nullptr)
+    namKnobs_->setModel(block_.namParamSpecs, block_.params.namParamValues);
   meta_.setTone(block_.tone);
   ToneMeta::Counts counts;
   counts.downloads = block_.tone.downloadsCount;
@@ -586,6 +591,21 @@ void BlockCard::layoutToneBody(juce::Rectangle<int> body) {
   image_.setBounds(imageFrame_.getLocalBounds());
   loading_.setCentrePosition(imageFrame_.getLocalBounds().getCentre());
   retry_.setCentrePosition(imageFrame_.getLocalBounds().getCentre());
+
+  // Parametric knobs sit in the meta column, between the metadata and the
+  // model picker. The card is a fixed height, so the row is given the space
+  // that is actually free there and no more -- it wraps and, past a certain
+  // knob count, is clipped rather than pushing the picker out of the card.
+  if (namKnobs_ != nullptr) {
+    const int top = content.getY() + rowH + kBodyGap;
+    const int available = selectWrap_.getY() - kBodyGap - top;
+    if (namKnobs_->isEmpty() || available <= 0) {
+      namKnobs_->setBounds(metaX, top, metaW, 0);
+    } else {
+      namKnobs_->setBounds(metaX, top, metaW,
+                           std::min(available, namKnobs_->preferredHeight(metaW)));
+    }
+  }
 }
 
 int BlockCard::layoutInfoBody(juce::Rectangle<int> body) {

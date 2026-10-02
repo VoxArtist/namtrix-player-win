@@ -62,6 +62,21 @@ inline constexpr double kSlimSizeLite = 0;
 inline constexpr double kSlimSizeFull = 1;
 inline bool isSlimSizeFull(double slimSize) { return slimSize >= 0.5; }
 
+// One knob a parametric NAM model declares for itself (config.params in the
+// .nam). Ranges are in the knob's own units -- the numbers printed on the real
+// faceplate -- not normalised. A "switch" is a discrete choice whose value is
+// an integer index into enumNames; native rejects a fractional one.
+struct NamParamSpec {
+  juce::String name;
+  float min = 0;
+  float max = 1;
+  float defaultValue = 0;
+  juce::String type;  // "continuous" | "switch"
+  juce::StringArray enumNames;
+
+  bool isSwitch() const { return type == "switch"; }
+};
+
 struct BlockParams {
   bool enabled = true;
   bool normalize = true;
@@ -70,6 +85,9 @@ struct BlockParams {
   double outputGain = 0.5;
   double mix = 1;
   BlockEqParams eq;
+  // Knob positions for a parametric model, positionally matched to
+  // ChainItem::namParamSpecs. Empty for snapshot models.
+  std::vector<float> namParamValues;
 };
 
 struct ToneModelRef {
@@ -119,6 +137,10 @@ struct ChainItem {
   bool irLong = false;
   std::optional<double> inputLevelDbu;
   std::optional<double> outputLevelDbu;
+  // Knob specs read off the loaded model. Empty for snapshot models and until
+  // the model finishes loading, which is what the UI keys off to decide
+  // whether to draw a knob row at all.
+  std::vector<NamParamSpec> namParamSpecs;
   BlockParams params;
 
   bool isTone() const { return !isInsert; }
