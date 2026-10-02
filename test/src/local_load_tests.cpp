@@ -231,6 +231,8 @@ TEST(LocalLoadTest, SnapshotNamExposesNoKnobs) {
   EXPECT_TRUE(block["namParamSpecs"].isVoid());
   EXPECT_TRUE(block["params"]["namParamValues"].isVoid());
   EXPECT_FALSE(proc.setBlockNamParam(res["blockId"].toString().toStdString(), 0, 1.0));
+}
+
 // The tile's glyph: a local tone carries the catalog `gear` id when native
 // could infer one from the file, and no `gear` at all otherwise (the UI then
 // keeps its generic file icon). Folders take the first file's answer.
