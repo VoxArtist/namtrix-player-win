@@ -3,6 +3,7 @@
 #include "core/Design.h"
 #include "core/Help.h"
 #include "core/NoDefaultFocus.h"
+#include "core/Namtrix.h"
 #include "core/Theme.h"
 
 namespace t3k::ui {
@@ -395,7 +396,11 @@ void PluginRoot::logout() {
 }
 
 // Layout
-void PluginRoot::paint(juce::Graphics& g) { g.fillAll(theme::kBlack); }
+void PluginRoot::paint(juce::Graphics& g) {
+  // Brushed-metal plate behind the whole window, black underneath it so a
+  // failed decode degrades to the original flat background.
+  Namtrix::drawBackground(g, getLocalBounds(), theme::kBlack);
+}
 
 void PluginRoot::openSettings(SettingsScreen::Tab tab) {
   if (settings_ != nullptr) {

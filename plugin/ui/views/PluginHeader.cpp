@@ -1,5 +1,6 @@
 #include "PluginHeader.h"
 
+#include "core/Namtrix.h"
 #include "core/Brand.h"
 #include "core/CustomIcons.h"
 #include "core/Design.h"
@@ -18,17 +19,48 @@ constexpr int kLogoWidth = 160;
 constexpr int kLogoHeight = 24;  // 160 * 32 / 210, rounded like the browser
 }  // namespace
 
-// The wordmark links to tone3000.com.
+// The NAMTRIX wordmark, with the product name and build version set beside
+// it. Not a link: the stock header opened tone3000.com, which is not where
+// this build comes from.
 class PluginHeader::LogoLink : public Clickable {
 public:
   LogoLink() : Clickable({}) {
-    setTitle("TONE3000");  // tone3000.com, to a screen reader
-    setMouseCursor(juce::MouseCursor::PointingHandCursor);
-    onClick = [] { juce::URL("https://www.tone3000.com").launchInDefaultBrowser(); };
+    setTitle("NAMTRIX Parametric Player");
+    setInterceptsMouseClicks(false, false);
   }
   void paintButton(juce::Graphics& g, bool, bool) override {
-    Brand::drawLogo(g, getLocalBounds().toFloat());
+    const auto bounds = getLocalBounds();
+    const auto& art = Namtrix::wordmark();
+    int textX = bounds.getX();
+    if (art.isValid()) {
+      // Sized by height so the art's aspect decides its width; the type then
+      // starts wherever the wordmark actually ends.
+      const int h = juce::jmin(bounds.getHeight(), kWordmarkHeight);
+      const int w = juce::roundToInt(h * art.getWidth() / static_cast<float>(art.getHeight()));
+      const int y = bounds.getY() + (bounds.getHeight() - h) / 2;
+      g.drawImage(art, bounds.getX(), y, w, h, 0, 0, art.getWidth(), art.getHeight());
+      textX = bounds.getX() + w + kWordmarkGap;
+    }
+
+    // Product name over build version, both left-aligned on the wordmark's
+    // trailing edge and centred as a pair against it.
+    const int textW = bounds.getRight() - textX;
+    if (textW <= 0)
+      return;
+    const int nameH = 15, versionH = 12;
+    const int top = bounds.getY() + (bounds.getHeight() - (nameH + versionH)) / 2;
+    g.setColour(theme::kWhite);
+    g.setFont(Fonts::mono(11.0f));
+    g.drawText("PARAMETRIC PLAYER", textX, top, textW, nameH, juce::Justification::centredLeft);
+    g.setColour(theme::kMuted);
+    g.setFont(Fonts::mono(10.0f));
+    g.drawText(Namtrix::kVersion, textX, top + nameH, textW, versionH,
+               juce::Justification::centredLeft);
   }
+
+private:
+  static constexpr int kWordmarkHeight = 22;
+  static constexpr int kWordmarkGap = 10;
 };
 
 PluginHeader::PluginHeader(Services& services)
