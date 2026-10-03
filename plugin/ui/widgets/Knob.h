@@ -62,6 +62,10 @@ public:
     bool labelBright = false;
     // Label above the knob instead of below (chain block trims).
     bool labelOnTop = false;
+    // Label size in px. Every stock knob uses the default; a row of long
+    // labels sharing narrow cells (a parametric model's controls) drops it
+    // rather than truncating names into ambiguity.
+    float labelPx = 14.0f;
   };
 
   // Every knob label is 14px in a 17px slot; the editor overflows that slot

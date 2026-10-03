@@ -84,7 +84,6 @@ private:
   void layoutHeader(juce::Rectangle<int> header);
   void layoutToneBody(juce::Rectangle<int> body);
   int layoutInfoBody(juce::Rectangle<int> body);
-  int namKnobsHeight() const;
   Body body() const { return showEq_ ? Body::eq : showInfo_ ? Body::info : Body::tone; }
   void syncFromBlock();
   void syncHeader();

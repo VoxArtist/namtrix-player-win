@@ -15,8 +15,12 @@ namespace {
 constexpr int kPadX = 24;
 constexpr int kGroupGap = 40;  // between header items
 constexpr int kPairGap = 16;   // tight pairs (undo/redo)
-constexpr int kLogoWidth = 160;
-constexpr int kLogoHeight = 24;  // 160 * 32 / 210, rounded like the browser
+// Wordmark plus "PARAMETRIC PLAYER" and the build version beside it. The stock
+// slot (160 x 24) fit TONE3000's single-line logo and truncated our two-line
+// type to "PARAMETRIC PL...". The preset bar starts well past 200px, so the
+// wider slot costs nothing.
+constexpr int kLogoWidth = 210;
+constexpr int kLogoHeight = 40;
 }  // namespace
 
 // The NAMTRIX wordmark, with the product name and build version set beside
@@ -59,7 +63,7 @@ public:
   }
 
 private:
-  static constexpr int kWordmarkHeight = 22;
+  static constexpr int kWordmarkHeight = 30;
   static constexpr int kWordmarkGap = 10;
 };
 

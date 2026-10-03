@@ -20,8 +20,10 @@ constexpr int kImageSizeInfo = 160;
 constexpr int kImageRadius = 8;
 constexpr int kRailMeterLength = 160;
 constexpr int kRailGap = 12;
-// Breathing room above and below the parametric knob strip.
-constexpr int kKnobStripPad = 10;
+// Smallest the artwork may shrink to make room for a parametric model's knobs.
+constexpr int kImageSizeMin = 48;
+// Vertical gap between the artwork row, the knob rows and the model picker.
+constexpr int kKnobRowGap = 10;
 constexpr int kNormalizeGap = 10;
 constexpr int kInfoBottomPad = 24;
 constexpr int kEqPillPadX = 12, kEqPillPadY = 4, kEqPillGap = 16;
@@ -204,10 +206,8 @@ void BlockCard::buildBody() {
   meta_.info().onOpenUrl = [](const juce::String& url) { juce::URL(url).launchInDefaultBrowser(); };
   body_.addAndMakeVisible(meta_);
 
-  // Added to the card, not the body: the strip sits under the body, and its
-  // bounds below are in card coordinates.
   namKnobs_ = std::make_unique<NamParamKnobs>(services_.chain, block_.blockId);
-  addAndMakeVisible(*namKnobs_);
+  body_.addAndMakeVisible(*namKnobs_);
 
   select_.onChange = [this](const juce::String& id) { switchModel(id); };
   // Opening retries a failed list fetch, so a transient failure never sticks.
@@ -488,17 +488,7 @@ void BlockCard::setBodyView() {
   resized();
 }
 
-// Height of the knob strip under the body, or 0 when there is nothing to show
-// (snapshot model, or a view that takes over the card).
-int BlockCard::namKnobsHeight() const {
-  if (namKnobs_ == nullptr || namKnobs_->isEmpty() || body() != Body::tone)
-    return 0;
-  const int w = kWidth - 2 - 2 * kBodyPadding;
-  return kKnobStripPad + namKnobs_->preferredHeight(w) + kKnobStripPad;
-}
-
 int BlockCard::preferredHeight() {
-  if (body() == Body::tone) return kHeight + namKnobsHeight();
   if (body() != Body::info) return kHeight;
   const int metaW = kWidth - 2 - 2 * kBodyPadding - kImageSizeInfo - kBodyGap;
   const int bodyH = kBodyPadding + std::max(kImageSizeInfo, meta_.heightFor(metaW)) + kInfoBottomPad;
@@ -510,22 +500,9 @@ void BlockCard::resized() {
   auto inner = getLocalBounds().reduced(1);
   layoutHeader(inner.removeFromTop(kHeaderHeight));
 
-  // The 275px body's last 2px hide under the card's bottom border. A
-  // parametric model's knobs get their own strip under it: the tone body is
-  // full at that height (192px artwork over a 36px picker leaves nothing), so
-  // the card grows instead, the way it already does for the info view.
-  const int knobStrip = namKnobsHeight();
+  // The 275px body's last 2px hide under the card's bottom border.
   const auto bodyArea = body() == Body::info ? inner : inner.withHeight(kBodyHeight);
   body_.setBounds(bodyArea);
-  if (namKnobs_ != nullptr) {
-    if (knobStrip > 0) {
-      const int w = inner.getWidth() - 2 * kBodyPadding;
-      namKnobs_->setBounds(inner.getX() + kBodyPadding, bodyArea.getBottom(), w, knobStrip);
-      namKnobs_->setVisible(true);
-    } else {
-      namKnobs_->setVisible(false);
-    }
-  }
   const auto local = body_.getLocalBounds();
   if (eqEditor_) eqEditor_->setBounds(local);
   infoBusy_.setBounds(local);
@@ -615,12 +592,28 @@ void BlockCard::layoutToneBody(juce::Rectangle<int> body) {
   selectWrap_.setBounds(centreX, bottom - kSelectHeight, centreW, kSelectHeight);
   select_.setBounds(selectWrap_.getLocalBounds());
 
-  const int metaX = centreX + kImageSize + kBodyGap;
-  const int metaW = centreW - kImageSize - kBodyGap;
+  // A parametric model's knobs share the centre column with the artwork. The
+  // card is pinned at its Figma height and already fills the chain area
+  // exactly (62px down + 320px + 24px pad = 406px), so it can't grow for
+  // them: the artwork shrinks instead. For a local model that costs nothing,
+  // since its artwork is only a generic file glyph.
+  const bool knobs = namKnobs_ != nullptr && !namKnobs_->isEmpty();
+  const int knobsH = knobs ? namKnobs_->preferredHeight(centreW) : 0;
+  const int topSpace = selectWrap_.getY() - content.getY() - (knobs ? knobsH + 2 * kKnobRowGap : 0);
+  const int imageSize = knobs ? juce::jlimit(kImageSizeMin, kImageSize, topSpace) : kImageSize;
+
+  const int metaX = centreX + imageSize + kBodyGap;
+  const int metaW = centreW - imageSize - kBodyGap;
   const int metaH = meta_.heightFor(metaW);
-  const int rowH = std::max(kImageSize, metaH);
-  imageFrame_.setBounds(centreX, content.getY() + (rowH - kImageSize) / 2, kImageSize, kImageSize);
+  const int rowH = knobs ? std::min(std::max(imageSize, metaH), topSpace) : std::max(imageSize, metaH);
+  imageFrame_.setBounds(centreX, content.getY() + (rowH - imageSize) / 2, imageSize, imageSize);
   meta_.setBounds(metaX, content.getY() + (rowH - metaH) / 2, metaW, metaH);
+
+  if (namKnobs_ != nullptr) {
+    namKnobs_->setVisible(knobs);
+    if (knobs)
+      namKnobs_->setBounds(centreX, content.getY() + rowH + kKnobRowGap, centreW, knobsH);
+  }
   image_.setBounds(imageFrame_.getLocalBounds());
   loading_.setCentrePosition(imageFrame_.getLocalBounds().getCentre());
   retry_.setCentrePosition(imageFrame_.getLocalBounds().getCentre());

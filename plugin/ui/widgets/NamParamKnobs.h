@@ -23,22 +23,22 @@ namespace t3k::ui {
 
 class NamParamKnobs : public juce::Component {
 public:
-  // Wide enough for a secondary knob plus the breathing room its label needs:
-  // labels are centred and single-line, so without a fixed cell the names of
-  // adjacent knobs collide.
+  // Cell width bounds. Cells narrow to keep every knob on one row, because the
+  // card is pinned at its Figma height and a second row would crowd out the
+  // tone's title. Below the floor a label has no usable room, so the row
+  // wraps instead.
   static constexpr int kCellWidth = 76;
+  static constexpr int kMinCellWidth = 56;
   static constexpr int kRowGap = 4;
 
   NamParamKnobs(ChainStore& chain, std::string blockId);
 
   // Rebuild for a new model, or follow a chain resync for the same one.
-  // Knobs are rebuilt only when the specs actually change; a resync that
-  // carries the same model just pushes values, so it cannot fight a drag.
+  // Knobs are rebuilt only when the set of controls changes; a resync for the
+  // same model just pushes values, so it cannot fight a drag.
   void setModel(const std::vector<NamParamSpec>& specs, const std::vector<float>& values);
 
-  bool isEmpty() const { return knobs_.empty(); }
-  // Height needed for `count` knobs at the given width, so the owner can size
-  // the row before it is populated.
+  bool isEmpty() const { return specs_.empty(); }
   int preferredHeight(int width) const;
 
   void resized() override;
@@ -47,20 +47,26 @@ private:
   struct Entry {
     NamParamSpec spec;
     std::unique_ptr<Knob> knob;
-    // Owned here: Knob::Options holds a bare pointer to its scale, so the
-    // scale has to outlive the knob.
+    // Knob::Options holds a bare pointer to its scale, so the scale has to
+    // outlive the knob.
     std::unique_ptr<KnobScale> scale;
     bool dragging = false;
   };
 
-  void rebuild(const std::vector<NamParamSpec>& specs, const std::vector<float>& values);
-  void pushValues(const std::vector<float>& values);
-  int columns(int width) const;
+  // Labels are fitted to a cell width, and a Knob's label is fixed at
+  // construction, so the knobs are (re)built for a specific width.
+  void build(int cellWidth);
+  void pushValues();
+  bool anyDragging() const;
+  int cellWidthFor(int width) const;
+  int perRowFor(int width) const;
 
   ChainStore& chain_;
   std::string blockId_;
   std::vector<NamParamSpec> specs_;
-  std::vector<std::unique_ptr<Entry>> knobs_;
+  std::vector<float> values_;
+  std::vector<std::unique_ptr<Entry>> entries_;
+  int builtCellWidth_ = 0;
 };
 
 }  // namespace t3k::ui

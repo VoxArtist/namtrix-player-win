@@ -199,6 +199,26 @@ void MockBackend::setNamSlimSizeDefault(double slimSize) {
 
 // Written through like the processor does it, so the store's synchronous
 // refresh after the call replays into the open block card.
+// Writes one knob into the block's namParamValues, mirroring native well
+// enough for the testbed: no clamping or switch rounding, which only the real
+// engine needs.
+bool MockBackend::setBlockNamParam(const std::string& blockId, int index, double value) {
+  for (const auto* lane : {"chain", "chainRight"}) {
+    if (auto* blocks = chain_[lane].getArray()) {
+      for (auto& block : *blocks) {
+        auto* params = block["params"].getDynamicObject();
+        if (block["blockId"].toString().toStdString() != blockId || params == nullptr) continue;
+        auto* values = params->getProperty("namParamValues").getArray();
+        if (values == nullptr || index < 0 || index >= values->size()) return false;
+        values->set(index, value);
+        bumpChain();
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 bool MockBackend::setBlockSlimSize(const std::string& blockId, double slimSize) {
   for (const auto* lane : {"chain", "chainRight"}) {
     if (auto* blocks = chain_[lane].getArray()) {

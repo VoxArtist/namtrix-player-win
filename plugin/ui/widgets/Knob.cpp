@@ -414,7 +414,7 @@ void Knob::paint(juce::Graphics& g) {
   const auto colour = readout || options_.labelBright ? theme::kWhite : theme::kGray;
   const auto text = readout ? options_.scale->format(value_) : options_.label;
   // Wide labels centre on the knob and overflow the column symmetrically.
-  g.setFont(Fonts::sans(kLabelSize));
+  g.setFont(Fonts::sans(options_.labelPx));
   g.setColour(colour);
   g.drawText(text, labelBounds().expanded(kLabelOverflow, 0), juce::Justification::centred, false);
 }
