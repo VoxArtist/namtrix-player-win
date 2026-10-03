@@ -20,6 +20,8 @@ constexpr int kImageSizeInfo = 160;
 constexpr int kImageRadius = 8;
 constexpr int kRailMeterLength = 160;
 constexpr int kRailGap = 12;
+// Breathing room above and below the parametric knob strip.
+constexpr int kKnobStripPad = 10;
 constexpr int kNormalizeGap = 10;
 constexpr int kInfoBottomPad = 24;
 constexpr int kEqPillPadX = 12, kEqPillPadY = 4, kEqPillGap = 16;
@@ -202,8 +204,10 @@ void BlockCard::buildBody() {
   meta_.info().onOpenUrl = [](const juce::String& url) { juce::URL(url).launchInDefaultBrowser(); };
   body_.addAndMakeVisible(meta_);
 
+  // Added to the card, not the body: the strip sits under the body, and its
+  // bounds below are in card coordinates.
   namKnobs_ = std::make_unique<NamParamKnobs>(services_.chain, block_.blockId);
-  body_.addAndMakeVisible(*namKnobs_);
+  addAndMakeVisible(*namKnobs_);
 
   select_.onChange = [this](const juce::String& id) { switchModel(id); };
   // Opening retries a failed list fetch, so a transient failure never sticks.
@@ -353,8 +357,14 @@ void BlockCard::syncHeader() {
 }
 
 void BlockCard::syncMeta() {
-  if (namKnobs_ != nullptr)
+  if (namKnobs_ != nullptr) {
+    const bool had = !namKnobs_->isEmpty();
     namKnobs_->setModel(block_.namParamSpecs, block_.params.namParamValues);
+    // Gaining or losing knobs changes the card's height, and the owner sizes
+    // the card from preferredHeight(); re-lay out so it is asked again.
+    if (had != !namKnobs_->isEmpty())
+      resized();
+  }
   meta_.setTone(block_.tone);
   ToneMeta::Counts counts;
   counts.downloads = block_.tone.downloadsCount;
@@ -478,7 +488,17 @@ void BlockCard::setBodyView() {
   resized();
 }
 
+// Height of the knob strip under the body, or 0 when there is nothing to show
+// (snapshot model, or a view that takes over the card).
+int BlockCard::namKnobsHeight() const {
+  if (namKnobs_ == nullptr || namKnobs_->isEmpty() || body() != Body::tone)
+    return 0;
+  const int w = kWidth - 2 - 2 * kBodyPadding;
+  return kKnobStripPad + namKnobs_->preferredHeight(w) + kKnobStripPad;
+}
+
 int BlockCard::preferredHeight() {
+  if (body() == Body::tone) return kHeight + namKnobsHeight();
   if (body() != Body::info) return kHeight;
   const int metaW = kWidth - 2 - 2 * kBodyPadding - kImageSizeInfo - kBodyGap;
   const int bodyH = kBodyPadding + std::max(kImageSizeInfo, meta_.heightFor(metaW)) + kInfoBottomPad;
@@ -490,9 +510,22 @@ void BlockCard::resized() {
   auto inner = getLocalBounds().reduced(1);
   layoutHeader(inner.removeFromTop(kHeaderHeight));
 
-  // The 275px body's last 2px hide under the card's bottom border.
+  // The 275px body's last 2px hide under the card's bottom border. A
+  // parametric model's knobs get their own strip under it: the tone body is
+  // full at that height (192px artwork over a 36px picker leaves nothing), so
+  // the card grows instead, the way it already does for the info view.
+  const int knobStrip = namKnobsHeight();
   const auto bodyArea = body() == Body::info ? inner : inner.withHeight(kBodyHeight);
   body_.setBounds(bodyArea);
+  if (namKnobs_ != nullptr) {
+    if (knobStrip > 0) {
+      const int w = inner.getWidth() - 2 * kBodyPadding;
+      namKnobs_->setBounds(inner.getX() + kBodyPadding, bodyArea.getBottom(), w, knobStrip);
+      namKnobs_->setVisible(true);
+    } else {
+      namKnobs_->setVisible(false);
+    }
+  }
   const auto local = body_.getLocalBounds();
   if (eqEditor_) eqEditor_->setBounds(local);
   infoBusy_.setBounds(local);
@@ -592,20 +625,6 @@ void BlockCard::layoutToneBody(juce::Rectangle<int> body) {
   loading_.setCentrePosition(imageFrame_.getLocalBounds().getCentre());
   retry_.setCentrePosition(imageFrame_.getLocalBounds().getCentre());
 
-  // Parametric knobs sit in the meta column, between the metadata and the
-  // model picker. The card is a fixed height, so the row is given the space
-  // that is actually free there and no more -- it wraps and, past a certain
-  // knob count, is clipped rather than pushing the picker out of the card.
-  if (namKnobs_ != nullptr) {
-    const int top = content.getY() + rowH + kBodyGap;
-    const int available = selectWrap_.getY() - kBodyGap - top;
-    if (namKnobs_->isEmpty() || available <= 0) {
-      namKnobs_->setBounds(metaX, top, metaW, 0);
-    } else {
-      namKnobs_->setBounds(metaX, top, metaW,
-                           std::min(available, namKnobs_->preferredHeight(metaW)));
-    }
-  }
 }
 
 int BlockCard::layoutInfoBody(juce::Rectangle<int> body) {
