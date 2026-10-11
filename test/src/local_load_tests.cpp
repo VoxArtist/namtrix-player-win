@@ -220,6 +220,40 @@ TEST(LocalLoadTest, ParametricNamExposesKnobsAndAcceptsEdits) {
   EXPECT_FALSE(proc.setBlockNamParam(blockId.toStdString(), 7, 1.0));
 }
 
+// A2's layout at a width the fast engine wasn't compiled for (it only exists
+// at 3 and 8 channels). The gate admits it and it runs on the generic engine.
+// The loosening is width only: a network that breaks any other A2 rule is
+// still refused at drop time.
+TEST(LocalLoadTest, WideA2ShapedNamLoadsOnTheGenericEngine) {
+  {
+    TONE3000Processor proc;
+    const juce::var res =
+        proc.loadLocalTone("a2-wide-16ch-test", filesOf({testFileEntry("a2-wide-16ch-test.nam")}));
+    EXPECT_TRUE(res["error"].isVoid()) << res["error"].toString().toStdString();
+    ASSERT_TRUE(waitForChainLoaded(proc));
+    const juce::var block = firstToneBlock(proc);
+    EXPECT_TRUE(static_cast<bool>(block["loaded"]));
+    EXPECT_FALSE(static_cast<bool>(block["loadFailed"]));
+  }
+
+  // Same file with one dilation changed: no longer A2-shaped at any width.
+  juce::var broken = juce::JSON::parse(testFile("a2-wide-16ch-test.nam"));
+  auto* layer = broken["config"]["layers"][0].getDynamicObject();
+  ASSERT_NE(layer, nullptr);
+  juce::Array<juce::var> dilations = *layer->getProperty("dilations").getArray();
+  dilations.set(0, static_cast<int>(dilations[0]) + 1);
+  layer->setProperty("dilations", dilations);
+  const juce::String brokenJson = juce::JSON::toString(broken);
+
+  TONE3000Processor proc;
+  const juce::var res = proc.loadLocalTone(
+      "not-a2", filesOf({fileEntry("not-a2.nam", juce::Base64::toBase64(
+                                                     brokenJson.toRawUTF8(),
+                                                     brokenJson.getNumBytesAsUTF8()))}));
+  EXPECT_EQ(res["error"].toString(),
+            juce::String("Only A2 and parametric NAM files are supported"));
+}
+
 TEST(LocalLoadTest, SnapshotNamExposesNoKnobs) {
   TONE3000Processor proc;
   const juce::var res =

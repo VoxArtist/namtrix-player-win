@@ -91,9 +91,40 @@ bool namConfigIsPhaseSafe(const nlohmann::json& modelJson) {
   return false;  // LSTM and anything unknown
 }
 
+// A2's layout at a width the fast engine was not compiled for (it is a
+// template instantiated only at 3 and 8 channels). These are still A2 in every
+// respect that matters to the runtime -- same layers, kernels, dilations,
+// activations and head -- so they are admitted and simply run on the generic
+// WaveNet engine, which is slower but exact.
+//
+// is_a2_shape is not loosened to say this: it also SELECTS the fast engine,
+// and a match at 16 channels would try to build a fast model that doesn't
+// exist. Instead the question is put to it exactly: would this config pass if
+// it were 8 wide? Only channels and bottleneck depend on width in that check,
+// so normalising those two leaves every other A2 rule enforced unchanged.
+bool namConfigIsWideA2(const nlohmann::json& modelJson) {
+  if (modelJson.value("architecture", "") != "WaveNet" || !modelJson.contains("config"))
+    return false;
+  nlohmann::json config = modelJson["config"];
+  auto layers = config.find("layers");
+  if (layers == config.end() || !layers->is_array() || layers->size() != 1 ||
+      !(*layers)[0].is_object())
+    return false;
+  auto& layerArray = (*layers)[0];
+  const int width = layerArray.value("channels", 0);
+  // A2 requires channels == bottleneck; keep that rule rather than paper over it.
+  if (width <= 0 || width != layerArray.value("bottleneck", 0))
+    return false;
+  layerArray["channels"] = 8;
+  layerArray["bottleneck"] = 8;
+  int fastWidth = 0;
+  return nam::wavenet::a2_fast::is_a2_shape(config, &fastWidth);
+}
+
 // Gate for drop-loaded local NAM files: the catalog only serves
 // architecture-2 models (the runtime is tuned around them: 48 kHz training
-// rate, the slimmable tiers, the fast path), so local files must be A2 too.
+// rate, the slimmable tiers, the fast path), so local files must be A2-shaped
+// too -- at the fast engine's widths, or wider on the generic engine.
 // Same container shape as namConfigIsPhaseSafe: a bare A2 WaveNet, or a
 // SlimmableContainer whose every submodel is one.
 bool namConfigIsA2(const nlohmann::json& modelJson) {
@@ -101,7 +132,8 @@ bool namConfigIsA2(const nlohmann::json& modelJson) {
   if (architecture == "WaveNet") {
     int channels = 0;
     return modelJson.contains("config") &&
-           nam::wavenet::a2_fast::is_a2_shape(modelJson["config"], &channels);
+           (nam::wavenet::a2_fast::is_a2_shape(modelJson["config"], &channels) ||
+            namConfigIsWideA2(modelJson));
   }
   if (architecture == "SlimmableContainer") {
     if (!modelJson.contains("config") || !modelJson["config"].contains("submodels"))
