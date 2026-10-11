@@ -306,6 +306,62 @@ juce::var stashLocalBytes(const juce::String& filename, juce::MemoryOutputStream
   return juce::var(model.get());
 }
 
+// Cover art for a local model: an image beside it with the same base name
+// ("M4 - Marshall.nam" + "M4 - Marshall.png"). Copied into the stash next to
+// the models, content-addressed like them, so the artwork survives the original
+// folder moving and ages out under the same 7-day sweep.
+//
+// Returns a file:// URL for the tone's images array, or an empty string. The
+// editor's ImageLoader reads file URLs directly (juce::URL streams local files),
+// decoding and sizing off the message thread like any catalog artwork.
+juce::String stashSiblingImage(const juce::File& modelFile) {
+  // Preference order when several siblings exist.
+  static const char* kImageExtensions[] = {".png", ".jpg", ".jpeg", ".webp", ".gif"};
+  // Decoration, so anything enormous is skipped rather than copied into the
+  // stash and decoded for a 192px tile.
+  static constexpr juce::int64 kMaxImageBytes = 8 * 1024 * 1024;
+
+  const juce::File directory = modelFile.getParentDirectory();
+  const juce::String stem = modelFile.getFileNameWithoutExtension();
+  for (const char* extension : kImageExtensions) {
+    // Case-insensitive match: "plexi.PNG" counts. Exact name first, since it is
+    // by far the common case and avoids listing the directory.
+    juce::File candidate = directory.getChildFile(stem + extension);
+    if (!candidate.existsAsFile()) {
+      candidate = juce::File();
+      for (const auto& sibling : directory.findChildFiles(juce::File::findFiles, false))
+        if (sibling.getFileName().equalsIgnoreCase(stem + extension)) {
+          candidate = sibling;
+          break;
+        }
+    }
+    if (candidate == juce::File() || candidate.getSize() <= 0)
+      continue;
+    if (candidate.getSize() > kMaxImageBytes) {
+      juce::Logger::writeToLog("[LocalLoad] Cover art too large, ignoring: " + candidate.getFileName());
+      continue;
+    }
+
+    juce::MemoryBlock bytes;
+    if (!candidate.loadFileAsData(bytes) || bytes.getSize() == 0)
+      continue;
+    const juce::uint64 hash = fnv1a64(bytes.getData(), bytes.getSize());
+    const juce::File stash = localModelsDir().getChildFile(
+        juce::String::toHexString(static_cast<juce::int64>(hash)) + "-" +
+        juce::String(static_cast<juce::int64>(bytes.getSize())) + juce::String(extension));
+    if (!stash.existsAsFile()) {
+      stash.getParentDirectory().createDirectory();
+      if (!stash.replaceWithData(bytes.getData(), bytes.getSize()))
+        continue;
+    } else {
+      stash.setLastModificationTime(juce::Time::getCurrentTime());  // keep it out of the sweep
+    }
+    juce::Logger::writeToLog("[LocalLoad] Cover art: " + candidate.getFileName());
+    return juce::URL(stash).toString(false);
+  }
+  return {};
+}
+
 // A file shipped as { name, data } with base64 bytes. The DSP tests feed
 // files this way (it predates the on-disk path below, from when the UI
 // could only hand over bytes); the UI itself always has a path.
@@ -500,7 +556,8 @@ juce::var TONE3000Processor::loadLocalTonePath(const juce::File& source,
       models.add(model);
     }
 
-    return finishLocalToneLoad(title, models, firstError, picked.size(), targetInsertId);
+    return finishLocalToneLoad(title, models, firstError, picked.size(), targetInsertId,
+                               stashSiblingImage(picked.getReference(0)));
   }
 
   const juce::String title = source.getFileNameWithoutExtension();
@@ -515,7 +572,7 @@ juce::var TONE3000Processor::loadLocalTonePath(const juce::File& source,
   if (!model.isObject())
     return localToneError(title, error);
 
-  return finishLocalToneLoad(title, {model}, {}, 1, targetInsertId);
+  return finishLocalToneLoad(title, {model}, {}, 1, targetInsertId, stashSiblingImage(source));
 }
 
 juce::var TONE3000Processor::loadLocalToneUrls(const juce::Array<juce::URL>& sources,
@@ -569,7 +626,8 @@ juce::var TONE3000Processor::loadLocalToneUrls(const juce::Array<juce::URL>& sou
 juce::var TONE3000Processor::finishLocalToneLoad(const juce::String& title,
                                                  const juce::Array<juce::var>& stashedModels,
                                                  const juce::String& firstError, int fileCount,
-                                                 const std::string& targetInsertId) {
+                                                 const std::string& targetInsertId,
+                                                 const juce::String& imageUrl) {
   // Identical bytes under two names would collide on the content-derived
   // id (cache key, picker selection); the first name wins.
   juce::Array<juce::var> models;
@@ -595,6 +653,10 @@ juce::var TONE3000Processor::finishLocalToneLoad(const juce::String& title,
   tone->setProperty("title", title);
   tone->setProperty("format", isNam ? "nam" : "ir");
   tone->setProperty("models", models);
+  // Cover art found beside the file. Same shape as a catalog tone's images
+  // array, so it reaches the tile and the detail card through the usual path.
+  if (imageUrl.isNotEmpty())
+    tone->setProperty("images", juce::Array<juce::var>{juce::var(imageUrl)});
 
   // Same catalog `gear` field a TONE3000 tone carries, inferred from the
   // first file (see stashLocalBytes); the tile draws that gear's glyph

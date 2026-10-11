@@ -254,6 +254,60 @@ TEST(LocalLoadTest, WideA2ShapedNamLoadsOnTheGenericEngine) {
             juce::String("Only A2 and parametric NAM files are supported"));
 }
 
+// Cover art: an image beside a local model with the same base name is
+// stashed with it and shipped as the tone's image. Case-insensitive on the
+// extension; absent when there is no sibling.
+TEST(LocalLoadTest, CoverArtBesideTheModelIsPickedUp) {
+  const auto makeFolder = [](const juce::String& name) {
+    auto dir = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                   .getChildFile("namtrix-cover-art-test").getChildFile(name);
+    dir.deleteRecursively();
+    dir.createDirectory();
+    EXPECT_TRUE(testFile("a2-amp-test.nam").copyFileTo(dir.getChildFile("plexi.nam")));
+    return dir;
+  };
+  const auto imageOf = [](TONE3000Processor& proc) {
+    const juce::var block = firstToneBlock(proc);
+    const juce::var tone = block["tone"];
+    const juce::var images = tone["images"];
+    return images.isArray() && images.size() > 0 ? images[0].toString() : juce::String();
+  };
+
+  {
+    // Uppercase extension on disk, to exercise the case-insensitive match.
+    const auto dir = makeFolder("with-art");
+    juce::Image art(juce::Image::RGB, 16, 16, true);
+    art.clear(art.getBounds(), juce::Colours::red);
+    juce::FileOutputStream out(dir.getChildFile("plexi.PNG"));
+    ASSERT_TRUE(out.openedOk());
+    juce::PNGImageFormat().writeImageToStream(art, out);
+    out.flush();
+
+    TONE3000Processor proc;
+    const juce::var res = proc.loadLocalTonePath(dir.getChildFile("plexi.nam"), {});
+    EXPECT_TRUE(res["error"].isVoid()) << res["error"].toString().toStdString();
+    ASSERT_TRUE(waitForChainLoaded(proc));
+
+    const juce::String url = imageOf(proc);
+    ASSERT_TRUE(url.isNotEmpty()) << "sibling image was not picked up";
+    const juce::File stashed = juce::URL(url).getLocalFile();
+    EXPECT_TRUE(stashed.existsAsFile());
+    // Stashed, not referenced in place: the original folder can move.
+    EXPECT_NE(stashed.getParentDirectory(), dir);
+    EXPECT_TRUE(juce::ImageFileFormat::loadFrom(stashed).isValid());
+    dir.deleteRecursively();
+  }
+
+  {
+    const auto dir = makeFolder("without-art");
+    TONE3000Processor proc;
+    proc.loadLocalTonePath(dir.getChildFile("plexi.nam"), {});
+    ASSERT_TRUE(waitForChainLoaded(proc));
+    EXPECT_TRUE(imageOf(proc).isEmpty());
+    dir.deleteRecursively();
+  }
+}
+
 TEST(LocalLoadTest, SnapshotNamExposesNoKnobs) {
   TONE3000Processor proc;
   const juce::var res =

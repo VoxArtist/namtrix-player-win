@@ -97,7 +97,9 @@ void ImageLoader::load(const juce::String& url, int side, Request& request,
 
 // Worker thread.
 juce::Image ImageLoader::produce(const juce::String& url, int side, Job& job) {
-  if (offline) return {};
+  // `offline` stands down network fetches; a local file (a local model's cover
+  // art) is still readable, so it is exempt.
+  if (offline && !juce::URL(url).isLocalFile()) return {};
   juce::Image source;
   std::optional<juce::Image> local;
   if (localOverride) local = localOverride(url);
