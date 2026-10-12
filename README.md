@@ -141,6 +141,21 @@ instead, the usual folders are:
 | Linux   | LV2    | `~/.lv2/`                               |
 | Linux   | CLAP   | `~/.clap/`                              |
 
+## Publishing
+
+The NAMTRIX website's "Download NAMTRIX Player" button always serves
+`https://namtrix.ummardesom.com/download/NAMTRIX-Player-macOS.zip`. To publish
+a new Player there, build the Release first (see Quick start), then run:
+
+```sh
+./script/publish_player.sh
+```
+
+It re-signs the VST3, AU and standalone, zips them with a READ ME, checks the
+signatures inside the zip, uploads it to the `namtrix` R2 bucket with wrangler
+(log in once with `npx wrangler login`), and confirms the live download matches.
+It refuses to publish a build older than the newest source change in `plugin/`.
+
 ## Linux runtime dependencies
 
 Required at run time: GTK3 (file dialogs), ALSA, fontconfig, X11, and libcurl
