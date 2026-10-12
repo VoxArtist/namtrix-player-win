@@ -567,6 +567,12 @@ private:
       block size times the current oversampling factor. */
   int chainDomainBlockSize() const noexcept;
 
+  /** The block size IR convolvers are prepared with right now: the base
+      block capped at kIrConvolverMaxBlockSize (see ChainBlock.h). */
+  int irConvolverBlockSize() const noexcept {
+    return irConvolverBlockSizeFor(chainBaseBlockSize());
+  }
+
   /** The effective chain rate: kChainBaseSampleRate × oversampling factor.
       Safe from any thread (the factor is atomic; it only changes inside the
       full re-prepare paths, never under the audio thread's feet). */
@@ -584,6 +590,13 @@ private:
     // engines carry their phase count and get re-queued by the apply step;
     // IR convolvers are rate-independent and always built at the base rate.)
     int preparedBlockSize = 0;
+
+    // The block size the convolvers were prepared with (irConvolverBlockSize
+    // at prepare time). The apply step re-prepares them when the live value
+    // differs: a restore-time load sees the 4096 default before prepareToPlay
+    // reports the real host block, and would otherwise sit at the cap on a
+    // host that really runs 64.
+    int preparedIrBlockSize = 0;
 
     std::unique_ptr<NamEngine> namEngine;
 
@@ -731,6 +744,16 @@ private:
   // Prepare every engine in a chain for the current chain rate (see
   // chainSampleRate) and chain-domain block size. Holds no lock.
   void prepareChain(std::vector<std::unique_ptr<ChainBlock>>& blocks);
+
+  // (Re)design one block's rate-dependent linear stages (EQ biquads, spectrum
+  // analyzer) for the current chain rate. prepareChain covers the blocks that
+  // exist when the chain domain moves (prepareToPlay, oversampling changes);
+  // every path that brings a tone block into the chain mid-session must call
+  // this as well, or the block's EQ runs coefficients designed for the
+  // default 48 kHz inside an oversampled chain and every band lands at
+  // freq × factor (issue #212). Resets the filters' state and the analyzer's
+  // history. Caller holds chainMutex.
+  void prepareBlockForChainRate(ChainBlock& block);
 
   // Recompute the longest loaded IR across both lanes into irTailBaseSamples
   // (base-rate samples; IRs always convolve at the base rate, see

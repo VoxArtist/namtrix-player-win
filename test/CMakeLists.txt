@@ -22,10 +22,12 @@ target_sources(DspTests PRIVATE
     src/dsp_tests.cpp
     src/dual_mono_tests.cpp
     src/duplicate_tests.cpp
+    src/eq_chain_rate_tests.cpp
     src/eq_post_routing_tests.cpp
     src/factory_preset_tests.cpp
     src/gate_tests.cpp
     src/host_program_tests.cpp
+    src/ir_block_size_tests.cpp
     src/ir_classification_tests.cpp
     src/ir_temp_file_tests.cpp
     src/local_load_tests.cpp
