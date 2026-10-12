@@ -190,9 +190,13 @@ juce::var TONE3000Processor::makeToneSummary(const juce::var& toneVar) {
   if (publishedAt.isNotEmpty())
     out->setProperty("published_at", publishedAt);
 
-  // Only the first image is ever rendered (block artwork).
+  // Only the first image is ever rendered (block artwork). A local tone's
+  // artwork file that has gone missing ships as none, so the UI draws the
+  // placeholder and then loads the re-derived file as a new URL (see
+  // localArtworkMissing).
   juce::Array<juce::var> images;
-  if (auto* imgs = tone->getProperty("images").getArray(); imgs != nullptr && !imgs->isEmpty())
+  if (auto* imgs = tone->getProperty("images").getArray();
+      imgs != nullptr && !imgs->isEmpty() && !(local && localArtworkMissing(toneVar)))
     images.add(imgs->getReference(0));
   out->setProperty("images", images);
 
@@ -224,6 +228,30 @@ juce::var TONE3000Processor::makeToneSummary(const juce::var& toneVar) {
   out->setProperty("models", models);
 
   return out.get();
+}
+
+bool TONE3000Processor::localArtworkMissing(const juce::var& toneVar) {
+  if (!static_cast<bool>(toneVar["local"]))
+    return false;
+  const auto* images = toneVar["images"].getArray();
+  if (images == nullptr || images->isEmpty())
+    return false;
+  const juce::URL url(images->getReference(0).toString());
+  return url.isLocalFile() && !url.getLocalFile().existsAsFile();
+}
+
+void TONE3000Processor::adoptRederivedArtwork(ChainBlock& block, const juce::String& artworkUrl) {
+  if (artworkUrl.isEmpty())
+    return;
+  // A copy: the parsed var is shared with history snapshots.
+  juce::var tone = juce::JSON::parse(block.toneJson);
+  auto* object = tone.getDynamicObject();
+  if (object == nullptr || !static_cast<bool>(object->getProperty("local")))
+    return;
+  object->setProperty("images", juce::Array<juce::var>{juce::var(artworkUrl)});
+  juce::Logger::writeToLog("[LocalLoad] Re-derived artwork for block " + juce::String(block.id));
+  setToneOnBlock(block, block.toneId, juce::JSON::toString(tone), tone);
+  bumpChainRevision();
 }
 
 void TONE3000Processor::setToneOnBlock(ChainBlock& block, int toneId, const juce::String& toneJson,
@@ -808,6 +836,7 @@ void TONE3000Processor::loadToneInBackground(const std::string& blockId, int fir
   // length check in setParamValues rejects it and the new model keeps its
   // own defaults.
   std::vector<float> namParamValues;
+  bool rederiveArtwork = false;
   {
     juce::ScopedLock lock(chainMutex);
     ChainBlock* block = findBlockById(blockId);
@@ -820,10 +849,11 @@ void TONE3000Processor::loadToneInBackground(const std::string& blockId, int fir
     block->modelCache[firstModelId] = modelData;
     namSlimSize = block->namSlimSize;
     namParamValues = block->namParamValues;
+    rederiveArtwork = localArtworkMissing(block->toneVar);
   }
 
-  PreparedBlockModel prepared =
-      prepareBlockModelOffThread(type, modelData, filename, namSlimSize, namParamValues);
+  PreparedBlockModel prepared = prepareBlockModelOffThread(type, modelData, filename, namSlimSize,
+                                                           namParamValues, rederiveArtwork);
   const bool applied = prepared.success;
 
   // A swapped tone's previous engine may still be audibly processing; let
@@ -851,6 +881,7 @@ void TONE3000Processor::loadToneInBackground(const std::string& blockId, int fir
     }
 
     applyPreparedModelToChainBlock(*block, type, prepared);
+    adoptRederivedArtwork(*block, prepared.artworkUrl);
   }
   // `prepared` now holds the block's *previous* engines (if any); they are
   // destroyed here, after the lock; teardown is too heavy to hold it.
@@ -874,6 +905,7 @@ void TONE3000Processor::switchModelInBackground(const std::string& blockId, int 
   // length check in setParamValues rejects it and the new model keeps its
   // own defaults.
   std::vector<float> namParamValues;
+  bool rederiveArtwork = false;
 
   {
     juce::ScopedLock lock(chainMutex);
@@ -896,6 +928,7 @@ void TONE3000Processor::switchModelInBackground(const std::string& blockId, int 
     blockTypeForPrepare = toneEngineType(block->toneVar, block->type);
     namSlimSize = block->namSlimSize;
     namParamValues = block->namParamValues;
+    rederiveArtwork = localArtworkMissing(block->toneVar);
     auto cacheIt = block->modelCache.find(modelId);
 
     if (cacheIt != block->modelCache.end()) {
@@ -926,7 +959,7 @@ void TONE3000Processor::switchModelInBackground(const std::string& blockId, int 
 
   PreparedBlockModel prepared =
       prepareBlockModelOffThread(blockTypeForPrepare, modelData, filename, namSlimSize,
-                                 namParamValues);
+                                 namParamValues, rederiveArtwork);
   const bool applied = prepared.success;
 
   // The outgoing model keeps processing until this moment; fade it out on
@@ -958,6 +991,7 @@ void TONE3000Processor::switchModelInBackground(const std::string& blockId, int 
     }
 
     applyPreparedModelToChainBlock(*block, blockTypeForPrepare, prepared);
+    adoptRederivedArtwork(*block, prepared.artworkUrl);
   }
   // `prepared` now holds the block's *previous* engines (if any); they are
   // destroyed here, after the lock; teardown is too heavy to hold it.

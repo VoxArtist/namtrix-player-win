@@ -232,14 +232,180 @@ juce::String localGearFromIr(const juce::AudioFormatReader& reader) {
   return seconds <= kShortIrMaxSeconds ? "cab" : juce::String();
 }
 
+// Artwork for local models: the image NAMTRIX embeds in the .nam itself
+// (metadata.image, a "data:image/jpeg;base64,..." or image/png data URL), or
+// an image beside the model with the same base name ("M4 - Marshall.nam" +
+// "M4 - Marshall.jpg"). Either way the bytes are copied into this cache,
+// named by their content hash, and the tone's images array points at the
+// copy with a file:// URL. The editor's ImageLoader reads file URLs directly
+// (juce::URL streams local files), decoding and sizing off the message thread
+// like any catalog artwork, so makeToneSummary and the UI need nothing new.
+//
+// Unlike the model stash, nothing here is swept: presets and DAW state point
+// at these files by path. If one goes missing anyway (cleared cache, another
+// Mac), the block's next model load re-derives it; see localArtworkMissing in
+// ProcessorChain.cpp.
+juce::File artworkCacheDir() {
+  juce::File base = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory);
+#if JUCE_MAC
+  base = base.getChildFile("Application Support");
+#endif
+  return base.getChildFile("NAMTRIX Player").getChildFile("Artwork");
+}
+
+// Artwork is decoration, so anything past these is ignored rather than
+// decoded for a 192 px tile. Embedded images are NAMTRIX's ~60 KB squares;
+// sidecars can be camera photos, hence the roomier cap.
+constexpr size_t kMaxEmbeddedArtworkBytes = 2 * 1024 * 1024;
+constexpr juce::int64 kMaxSidecarArtworkBytes = 8 * 1024 * 1024;
+
+// ".jpg" or ".png" when the bytes decode as that format, else nullptr. Sniffed
+// from the bytes rather than trusted from a MIME type or file extension, and
+// decoded once in full: a truncated or corrupt image must fall back to the
+// placeholder here, not reach the UI as a URL that never draws.
+const char* decodableArtworkExtension(const void* data, size_t size) {
+  juce::MemoryInputStream in(data, size, false);
+  const char* extension = nullptr;
+  if (juce::JPEGImageFormat().canUnderstand(in)) {
+    extension = ".jpg";
+  } else {
+    in.setPosition(0);
+    if (juce::PNGImageFormat().canUnderstand(in))
+      extension = ".png";
+  }
+  if (extension == nullptr || !juce::ImageFileFormat::loadFrom(data, size).isValid())
+    return nullptr;
+  return extension;
+}
+
+// Copy image bytes into the artwork cache (written only when that content
+// isn't there yet) and return its file:// URL, or "" when they don't decode
+// or can't be stored.
+juce::String cacheArtworkBytes(const void* data, size_t size) {
+  const char* extension = decodableArtworkExtension(data, size);
+  if (extension == nullptr)
+    return {};
+  const juce::uint64 hash = fnv1a64(data, size);
+  const juce::File cached = artworkCacheDir().getChildFile(
+      juce::String::toHexString(static_cast<juce::int64>(hash)) + "-" +
+      juce::String(static_cast<juce::int64>(size)) + extension);
+  if (!cached.existsAsFile() &&
+      !(TONE3000Processor::ensureWritableDir(cached.getParentDirectory()) &&
+        cached.replaceWithData(data, size)))
+    return {};
+  return juce::URL(cached).toString(false);
+}
+
+// The model's embedded artwork, cached; "" when it has none or it's unusable.
+// Never throws: a bad image must not stop the model loading.
+juce::String cacheEmbeddedArtwork(const nlohmann::json& config) {
+  try {
+    const auto metadata = config.find("metadata");
+    if (metadata == config.end() || !metadata->is_object())
+      return {};
+    const auto image = metadata->find("image");
+    if (image == metadata->end() || !image->is_string())
+      return {};
+    const auto& dataUrl = image->get_ref<const std::string&>();
+    if (dataUrl.empty())
+      return {};
+
+    auto reject = [](const juce::String& why) {
+      juce::Logger::writeToLog("[LocalLoad] Embedded artwork ignored: " + why);
+      return juce::String();
+    };
+
+    const size_t comma = dataUrl.find(',');
+    if (comma == std::string::npos || comma > 64)
+      return reject("not a data URL");
+    const juce::String header =
+        juce::String(dataUrl.data(), comma).trim().toLowerCase().removeCharacters(" ");
+    if (header != "data:image/jpeg;base64" && header != "data:image/jpg;base64" &&
+        header != "data:image/png;base64")
+      return reject("not a base64 JPEG or PNG data URL");
+
+    // Base64 is 4 chars per 3 bytes; checked before decoding so an oversized
+    // payload costs nothing. The slack covers line breaks some encoders add.
+    const size_t payloadChars = dataUrl.size() - comma - 1;
+    if (payloadChars > kMaxEmbeddedArtworkBytes / 3 * 4 + 4096)
+      return reject("too large");
+    const juce::String payload =
+        juce::String(dataUrl.data() + comma + 1, payloadChars).removeCharacters(" \t\r\n");
+    juce::MemoryOutputStream decoded;
+    if (!juce::Base64::convertFromBase64(decoded, payload) || decoded.getDataSize() == 0)
+      return reject("bad base64");
+    if (decoded.getDataSize() > kMaxEmbeddedArtworkBytes)
+      return reject("too large");
+
+    const juce::String url = cacheArtworkBytes(decoded.getData(), decoded.getDataSize());
+    if (url.isEmpty())
+      return reject("doesn't decode as an image");
+    return url;
+  } catch (const std::exception&) {
+    return {};
+  }
+}
+
+// The same-named image beside a model, cached; "" when there is none.
+juce::String cacheSidecarArtwork(const juce::File& modelFile) {
+  // Preference order when several exist.
+  static const char* kImageExtensions[] = {".jpg", ".jpeg", ".png"};
+
+  const juce::File directory = modelFile.getParentDirectory();
+  const juce::String stem = modelFile.getFileNameWithoutExtension();
+  // Exact names first, since that is by far the common case and avoids
+  // listing the directory; then one case-insensitive pass ("plexi.PNG").
+  juce::Array<juce::File> candidates;
+  for (const char* extension : kImageExtensions)
+    if (const juce::File exact = directory.getChildFile(stem + extension); exact.existsAsFile())
+      candidates.add(exact);
+  if (candidates.isEmpty()) {
+    const auto siblings = directory.findChildFiles(juce::File::findFiles, false);
+    for (const char* extension : kImageExtensions)
+      for (const auto& sibling : siblings)
+        if (sibling.getFileName().equalsIgnoreCase(stem + extension))
+          candidates.add(sibling);
+  }
+
+  for (const auto& candidate : candidates) {
+    if (candidate.getSize() <= 0)
+      continue;
+    if (candidate.getSize() > kMaxSidecarArtworkBytes) {
+      juce::Logger::writeToLog("[LocalLoad] Artwork too large, ignoring: " + candidate.getFileName());
+      continue;
+    }
+    juce::MemoryBlock bytes;
+    if (!candidate.loadFileAsData(bytes) || bytes.getSize() == 0)
+      continue;
+    if (const juce::String url = cacheArtworkBytes(bytes.getData(), bytes.getSize());
+        url.isNotEmpty()) {
+      juce::Logger::writeToLog("[LocalLoad] Artwork: " + candidate.getFileName());
+      return url;
+    }
+  }
+  return {};
+}
+
+// The first sidecar among a load's models, in load order; "" when none has one.
+juce::String cacheSidecarArtwork(const juce::Array<juce::File>& modelFiles) {
+  for (const auto& file : modelFiles)
+    if (const juce::String url = cacheSidecarArtwork(file); url.isNotEmpty())
+      return url;
+  return {};
+}
+
 // One local file's bytes: validate and stash a content-addressed copy.
 // Validation happens here, at load time, instead of letting a bad file
 // reach the background loader: its failure surfaces as a retry badge, which
 // is the wrong affordance for a file that can never load. Returns the model
 // object { id, name, model_url[, gear] } for the synthetic tone, or void
 // with `error` set to a user-facing message.
+//
+// `artworkUrl`, when given and still empty, receives the model's embedded
+// artwork (see cacheEmbeddedArtwork), read from the JSON validation already
+// parsed, so a folder load ends up with the first model's that has one.
 juce::var stashLocalBytes(const juce::String& filename, juce::MemoryOutputStream& decoded,
-                          juce::String& error) {
+                          juce::String& error, juce::String* artworkUrl = nullptr) {
   auto fail = [&](const juce::String& message) {
     juce::Logger::writeToLog("[LocalLoad] " + filename + ": " + message);
     error = message;
@@ -254,6 +420,7 @@ juce::var stashLocalBytes(const juce::String& filename, juce::MemoryOutputStream
   // Inferred while the file is open for validation anyway (see
   // localGearFromNamMetadata / localGearFromIr); "" when unknown.
   juce::String gear;
+  juce::String artwork;
   if (isNam) {
     try {
       const auto* bytes = static_cast<const char*>(decoded.getData());
@@ -261,6 +428,8 @@ juce::var stashLocalBytes(const juce::String& filename, juce::MemoryOutputStream
       if (!namConfigIsA2(config) && !namConfigIsParametric(config))
         return fail("Only A2 and parametric NAM files are supported");
       gear = localGearFromNamMetadata(config);
+      if (artworkUrl != nullptr && artworkUrl->isEmpty())
+        artwork = cacheEmbeddedArtwork(config);
     } catch (const std::exception&) {
       return fail("Not a valid NAM file");
     }
@@ -304,82 +473,31 @@ juce::var stashLocalBytes(const juce::String& filename, juce::MemoryOutputStream
   model->setProperty("model_url", juce::URL(stash).toString(false));
   if (gear.isNotEmpty())
     model->setProperty("gear", gear);
+  // Only once the model itself made it: a file that fails to stash can't
+  // lend the tone its artwork.
+  if (artwork.isNotEmpty())
+    *artworkUrl = artwork;
   return juce::var(model.get());
-}
-
-// Cover art for a local model: an image beside it with the same base name
-// ("M4 - Marshall.nam" + "M4 - Marshall.png"). Copied into the stash next to
-// the models, content-addressed like them, so the artwork survives the original
-// folder moving and ages out under the same 7-day sweep.
-//
-// Returns a file:// URL for the tone's images array, or an empty string. The
-// editor's ImageLoader reads file URLs directly (juce::URL streams local files),
-// decoding and sizing off the message thread like any catalog artwork.
-juce::String stashSiblingImage(const juce::File& modelFile) {
-  // Preference order when several siblings exist.
-  static const char* kImageExtensions[] = {".png", ".jpg", ".jpeg", ".webp", ".gif"};
-  // Decoration, so anything enormous is skipped rather than copied into the
-  // stash and decoded for a 192px tile.
-  static constexpr juce::int64 kMaxImageBytes = 8 * 1024 * 1024;
-
-  const juce::File directory = modelFile.getParentDirectory();
-  const juce::String stem = modelFile.getFileNameWithoutExtension();
-  for (const char* extension : kImageExtensions) {
-    // Case-insensitive match: "plexi.PNG" counts. Exact name first, since it is
-    // by far the common case and avoids listing the directory.
-    juce::File candidate = directory.getChildFile(stem + extension);
-    if (!candidate.existsAsFile()) {
-      candidate = juce::File();
-      for (const auto& sibling : directory.findChildFiles(juce::File::findFiles, false))
-        if (sibling.getFileName().equalsIgnoreCase(stem + extension)) {
-          candidate = sibling;
-          break;
-        }
-    }
-    if (candidate == juce::File() || candidate.getSize() <= 0)
-      continue;
-    if (candidate.getSize() > kMaxImageBytes) {
-      juce::Logger::writeToLog("[LocalLoad] Cover art too large, ignoring: " + candidate.getFileName());
-      continue;
-    }
-
-    juce::MemoryBlock bytes;
-    if (!candidate.loadFileAsData(bytes) || bytes.getSize() == 0)
-      continue;
-    const juce::uint64 hash = fnv1a64(bytes.getData(), bytes.getSize());
-    const juce::File stash = localModelsDir().getChildFile(
-        juce::String::toHexString(static_cast<juce::int64>(hash)) + "-" +
-        juce::String(static_cast<juce::int64>(bytes.getSize())) + juce::String(extension));
-    if (!stash.existsAsFile()) {
-      stash.getParentDirectory().createDirectory();
-      if (!stash.replaceWithData(bytes.getData(), bytes.getSize()))
-        continue;
-    } else {
-      stash.setLastModificationTime(juce::Time::getCurrentTime());  // keep it out of the sweep
-    }
-    juce::Logger::writeToLog("[LocalLoad] Cover art: " + candidate.getFileName());
-    return juce::URL(stash).toString(false);
-  }
-  return {};
 }
 
 // A file shipped as { name, data } with base64 bytes. The DSP tests feed
 // files this way (it predates the on-disk path below, from when the UI
 // could only hand over bytes); the UI itself always has a path.
 juce::var stashLocalFile(const juce::String& filename, const juce::String& base64Data,
-                         juce::String& error) {
+                         juce::String& error, juce::String* artworkUrl) {
   juce::MemoryOutputStream decoded;
   if (!juce::Base64::convertFromBase64(decoded, base64Data) || decoded.getDataSize() == 0) {
     juce::Logger::writeToLog("[LocalLoad] " + filename + ": Couldn't read the dropped file");
     error = "Couldn't read the dropped file";
     return {};
   }
-  return stashLocalBytes(filename, decoded, error);
+  return stashLocalBytes(filename, decoded, error, artworkUrl);
 }
 
 // A file native already has on disk (the tile menus' file picker flow;
 // no base64 round-trip).
-juce::var stashLocalFileFromDisk(const juce::File& file, juce::String& error) {
+juce::var stashLocalFileFromDisk(const juce::File& file, juce::String& error,
+                                 juce::String* artworkUrl) {
   juce::MemoryOutputStream bytes;
   juce::FileInputStream in(file);
   if (!in.openedOk() || bytes.writeFromInputStream(in, -1) <= 0) {
@@ -387,7 +505,7 @@ juce::var stashLocalFileFromDisk(const juce::File& file, juce::String& error) {
     error = "Couldn't read the file";
     return {};
   }
-  return stashLocalBytes(file.getFileName(), bytes, error);
+  return stashLocalBytes(file.getFileName(), bytes, error, artworkUrl);
 }
 
 // A file the OS document picker handed us as a security-scoped URL.
@@ -403,7 +521,8 @@ juce::var stashLocalFileFromDisk(const juce::File& file, juce::String& error) {
 // desktop build correctly does, is refused by the sandbox and surfaces as
 // "Couldn't read the file". juce::URL::createInputStream goes through the
 // bookmark and the scope, so it reads the same bytes the user actually picked.
-juce::var stashLocalFileFromUrl(const juce::URL& url, juce::String& error) {
+juce::var stashLocalFileFromUrl(const juce::URL& url, juce::String& error,
+                                juce::String* artworkUrl) {
   const juce::String filename = TONE3000Processor::localFileNameFromUrl(url);
   juce::MemoryOutputStream bytes;
   const auto in = url.createInputStream(
@@ -413,7 +532,7 @@ juce::var stashLocalFileFromUrl(const juce::URL& url, juce::String& error) {
     error = "Couldn't read the file";
     return {};
   }
-  return stashLocalBytes(filename, bytes, error);
+  return stashLocalBytes(filename, bytes, error, artworkUrl);
 }
 
 // Shared user-facing error result for the local-load entry points.
@@ -495,9 +614,11 @@ juce::var TONE3000Processor::loadLocalTone(const juce::String& title, const juce
   // single-file drop is exactly that file's error).
   juce::Array<juce::var> models;
   juce::String firstError;
+  juce::String artworkUrl;  // embedded only: bytes carry no folder to look beside
   for (const auto& file : *fileArray) {
     juce::String error;
-    const juce::var model = stashLocalFile(file["name"].toString(), file["data"].toString(), error);
+    const juce::var model =
+        stashLocalFile(file["name"].toString(), file["data"].toString(), error, &artworkUrl);
     if (!model.isObject()) {
       if (firstError.isEmpty())
         firstError = error;
@@ -506,7 +627,8 @@ juce::var TONE3000Processor::loadLocalTone(const juce::String& title, const juce
     models.add(model);
   }
 
-  return finishLocalToneLoad(title, models, firstError, fileArray->size(), targetInsertId);
+  return finishLocalToneLoad(title, models, firstError, fileArray->size(), targetInsertId,
+                             artworkUrl);
 }
 
 juce::var TONE3000Processor::loadLocalTonePath(const juce::File& source,
@@ -546,9 +668,10 @@ juce::var TONE3000Processor::loadLocalTonePath(const juce::File& source,
 
     juce::Array<juce::var> models;
     juce::String firstError;
+    juce::String artworkUrl;
     for (const auto& file : picked) {
       juce::String error;
-      const juce::var model = stashLocalFileFromDisk(file, error);
+      const juce::var model = stashLocalFileFromDisk(file, error, &artworkUrl);
       if (!model.isObject()) {
         if (firstError.isEmpty())
           firstError = error;
@@ -557,8 +680,11 @@ juce::var TONE3000Processor::loadLocalTonePath(const juce::File& source,
       models.add(model);
     }
 
+    // Embedded artwork wins; otherwise the first model with an image beside it.
+    if (artworkUrl.isEmpty() && !models.isEmpty())
+      artworkUrl = cacheSidecarArtwork(picked);
     return finishLocalToneLoad(title, models, firstError, picked.size(), targetInsertId,
-                               stashSiblingImage(picked.getReference(0)));
+                               artworkUrl);
   }
 
   const juce::String title = source.getFileNameWithoutExtension();
@@ -569,11 +695,14 @@ juce::var TONE3000Processor::loadLocalTonePath(const juce::File& source,
     return localToneError(title, "File is too large");
 
   juce::String error;
-  const juce::var model = stashLocalFileFromDisk(source, error);
+  juce::String artworkUrl;
+  const juce::var model = stashLocalFileFromDisk(source, error, &artworkUrl);
   if (!model.isObject())
     return localToneError(title, error);
 
-  return finishLocalToneLoad(title, {model}, {}, 1, targetInsertId, stashSiblingImage(source));
+  if (artworkUrl.isEmpty())
+    artworkUrl = cacheSidecarArtwork(source);
+  return finishLocalToneLoad(title, {model}, {}, 1, targetInsertId, artworkUrl);
 }
 
 juce::var TONE3000Processor::loadLocalToneUrls(const juce::Array<juce::URL>& sources,
@@ -607,9 +736,12 @@ juce::var TONE3000Processor::loadLocalToneUrls(const juce::Array<juce::URL>& sou
   juce::String firstError;
   // No extension check here: stashLocalBytes rejects anything but .nam and
   // .wav by name before it looks at the bytes, with the same message.
+  // Embedded artwork only: a security-scoped URL can't be listed for a
+  // sidecar beside it (see stashLocalFileFromUrl).
+  juce::String artworkUrl;
   for (const auto& url : picked) {
     juce::String error;
-    const juce::var model = stashLocalFileFromUrl(url, error);
+    const juce::var model = stashLocalFileFromUrl(url, error, &artworkUrl);
     if (!model.isObject()) {
       if (firstError.isEmpty())
         firstError = error;
@@ -621,7 +753,8 @@ juce::var TONE3000Processor::loadLocalToneUrls(const juce::Array<juce::URL>& sou
   if (models.isEmpty())
     return localToneError(title, firstError.isEmpty() ? "Couldn't read the file" : firstError);
 
-  return finishLocalToneLoad(title, models, firstError, picked.size(), targetInsertId);
+  return finishLocalToneLoad(title, models, firstError, picked.size(), targetInsertId,
+                             artworkUrl);
 }
 
 juce::var TONE3000Processor::finishLocalToneLoad(const juce::String& title,
@@ -654,8 +787,9 @@ juce::var TONE3000Processor::finishLocalToneLoad(const juce::String& title,
   tone->setProperty("title", title);
   tone->setProperty("format", isNam ? "nam" : "ir");
   tone->setProperty("models", models);
-  // Cover art found beside the file. Same shape as a catalog tone's images
-  // array, so it reaches the tile and the detail card through the usual path.
+  // Artwork embedded in a model or found beside one (cacheEmbeddedArtwork,
+  // cacheSidecarArtwork). Same shape as a catalog tone's images array, so it
+  // reaches the tile and the detail card through the usual path.
   if (imageUrl.isNotEmpty())
     tone->setProperty("images", juce::Array<juce::var>{juce::var(imageUrl)});
 
@@ -964,7 +1098,8 @@ TONE3000Processor::PreparedBlockModel TONE3000Processor::prepareBlockModelOffThr
     const std::vector<uint8_t>& modelData,
     const juce::String& filename,
     double namSlimSize,
-    const std::vector<float>& namParamValues) {
+    const std::vector<float>& namParamValues,
+    bool rederiveArtwork) {
   PreparedBlockModel out;
 
   if (modelData.empty()) {
@@ -987,6 +1122,10 @@ TONE3000Processor::PreparedBlockModel TONE3000Processor::prepareBlockModelOffThr
       // temp dirs) on Windows and the load fails silently.
       const nlohmann::json config =
           nlohmann::json::parse(modelData.begin(), modelData.end());
+
+      // From the JSON this prepare parses anyway; never fails the load.
+      if (rederiveArtwork)
+        out.artworkUrl = cacheEmbeddedArtwork(config);
 
       // Oversampling: phase-safe architectures get one native-rate instance
       // per phase (see NamEngine.h); anything else runs a single instance

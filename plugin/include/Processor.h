@@ -609,6 +609,11 @@ private:
     // can override this; see irIsLongFor in ProcessorModelLoader.cpp.
     bool irIsLongByLength = false;
     float irNormalizationGainLinear = 1.0f;
+
+    // A local tone's artwork re-derived from this model's embedded image
+    // (asked for when the tone's cached artwork file has gone missing; see
+    // adoptRederivedArtwork). Empty when not asked for or not found.
+    juce::String artworkUrl;
   };
 
   /** CPU/file heavy; call without holding `chainMutex`. NAM engines come out
@@ -617,7 +622,8 @@ private:
       lock). */
   PreparedBlockModel prepareBlockModelOffThread(ChainBlockType type, const std::vector<uint8_t>& modelData,
                                                 const juce::String& filename, double namSlimSize,
-                                                const std::vector<float>& namParamValues = {});
+                                                const std::vector<float>& namParamValues = {},
+                                                bool rederiveArtwork = false);
   /** Short path under `chainMutex` only: swaps the new engines onto `block`
       and stamps `newType` (a tone swap may change the block's type; the old
       engine kept processing under the old type until this moment). The
@@ -808,6 +814,13 @@ private:
   // the full API payload (model URLs, tags, counts…) per block per sync is
   // waste.
   static juce::var makeToneSummary(const juce::var& toneVar);
+  // A local tone whose artwork points at a file that isn't there (cleared
+  // cache, a chain from another Mac). The summary then ships no image, and
+  // the block's next model prepare re-derives it from the model.
+  static bool localArtworkMissing(const juce::var& toneVar);
+  // Under chainMutex: point the block's tone at artwork a prepare re-derived
+  // (PreparedBlockModel::artworkUrl). No-op for an empty URL.
+  void adoptRederivedArtwork(ChainBlock& block, const juce::String& artworkUrl);
   static void serializeChainToTree(const std::vector<std::unique_ptr<ChainBlock>>& blocks,
                                    juce::ValueTree& chainState, bool includeModelData);
 
