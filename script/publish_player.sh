@@ -32,8 +32,11 @@ die() {
   exit 1
 }
 
-version="$(tr -d '[:space:]' < VERSION)"
-[ -n "$version" ] || die "VERSION is empty"
+# The version people see in the Player's header (core/Namtrix.h), not the
+# VERSION file: that still carries upstream TONE3000's number, which drives
+# their installer and update check.
+version="$(sed -nE 's/.*kVersion = "([^"]+)".*/\1/p' plugin/ui/core/Namtrix.h)"
+[ -n "$version" ] || die "couldn't read the Player version from plugin/ui/core/Namtrix.h"
 
 # 1. All three builds present, and none older than the source they came from.
 #
@@ -69,6 +72,11 @@ Build the Release first (see README, Quick start)."
   source  $(stat -f '%Sm' "$newest_src_file")  ($newest_src_file)
 Rebuild the Release before publishing."
   fi
+  # The READ ME and the summary name this version, so the build has to carry
+  # it. Process substitution, not `strings | grep -q`: grep quitting early
+  # would SIGPIPE strings, and pipefail would read a match as a failure.
+  grep -qxF -- "$version" <(strings "$binary") ||
+    die "$bundle doesn't contain $version (from plugin/ui/core/Namtrix.h). Rebuild the Release."
 done
 
 work="$(mktemp -d -t namtrix-publish)"
