@@ -10,7 +10,7 @@ struct Namtrix {
   // Build version, shown beside the wordmark. Bumped on every edit to this
   // fork so it is always clear, at a glance, whether the running plugin is
   // the build you just made.
-  static constexpr const char* kVersion = "v0.18";
+  static constexpr const char* kVersion = "v0.19";
 
   // The wordmark, white on transparency, and its inverted cut for light
   // backgrounds.
