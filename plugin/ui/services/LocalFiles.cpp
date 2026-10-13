@@ -13,7 +13,13 @@ void LocalFiles::report(const juce::String& error) {
 
 void LocalFiles::drop(const std::string& targetBlockId, const juce::StringArray& paths) {
   if (paths.isEmpty()) return;
-  report(chain_.loadLocalTonePath(juce::File(paths[0]), targetBlockId));
+  const juce::File first(paths[0]);
+  // A photo on a model becomes its artwork, saved into the .nam itself.
+  if (first.hasFileExtension("jpg;jpeg;png")) {
+    report(chain_.embedLocalArtwork(targetBlockId, first));
+    return;
+  }
+  report(chain_.loadLocalTonePath(first, targetBlockId));
 }
 
 void LocalFiles::pick(const std::string& targetBlockId, Kind kind) {

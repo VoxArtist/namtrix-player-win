@@ -53,6 +53,10 @@ juce::var ProcessorBackend::loadLocalTonePath(const juce::File& source,
                                               const std::string& targetInsertId) {
   return processor_.loadLocalTonePath(source, targetInsertId);
 }
+juce::var ProcessorBackend::embedLocalArtwork(const std::string& blockId, const juce::File& image) {
+  return processor_.embedLocalArtwork(blockId, image);
+}
+
 juce::var ProcessorBackend::loadLocalToneUrls(const juce::Array<juce::URL>& sources,
                                               const std::string& targetInsertId) {
   return processor_.loadLocalToneUrls(sources, targetInsertId);

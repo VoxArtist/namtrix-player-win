@@ -180,6 +180,10 @@ juce::var MockBackend::loadLocalToneUrls(const juce::Array<juce::URL>&, const st
   return obj({{"blockId", "blk-local"}});
 }
 
+juce::var MockBackend::embedLocalArtwork(const std::string&, const juce::File& image) {
+  return obj({{"savedTo", image.getFileNameWithoutExtension() + ".nam"}});
+}
+
 void MockBackend::setInputMode(const juce::String& mode) {
   auto* chain = chain_.getDynamicObject();
   chain->setProperty("inputMode", mode);

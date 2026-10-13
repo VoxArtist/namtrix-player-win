@@ -119,6 +119,14 @@ public:
       only the iOS editor calls it. */
   juce::var loadLocalToneUrls(const juce::Array<juce::URL>& sources,
                               const std::string& targetInsertId = {});
+
+  /** A photo dropped on a block holding a .nam loaded from disk: write it
+      into that file as its artwork (metadata.image, a 512 px square JPEG
+      data URL, the format NAMTRIX writes) and show it on the block. The
+      block's active model is the file written; nothing else in it changes.
+      Returns {} on success or a user-facing { error }; the file is left
+      untouched on any error. */
+  juce::var embedLocalArtwork(const std::string& blockId, const juce::File& image);
   // Age out local-model stash files unused for a week (runs once per
   // process, off-thread). Called from the constructor.
   static void cleanLocalModelStash();

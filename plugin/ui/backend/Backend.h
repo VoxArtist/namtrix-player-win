@@ -47,6 +47,9 @@ public:
   virtual juce::var loadLocalTonePath(const juce::File& source, const std::string& targetInsertId) = 0;
   virtual juce::var loadLocalToneUrls(const juce::Array<juce::URL>& sources,
                                       const std::string& targetInsertId) = 0;
+  // A photo dropped on a block: saved into its .nam file as the artwork.
+  // { savedTo: file name } or a user-facing { error }.
+  virtual juce::var embedLocalArtwork(const std::string& blockId, const juce::File& image) = 0;
   virtual bool swapTone(const std::string& blockId, const juce::String& toneJson) = 0;
   virtual bool refreshToneMetadata(const juce::String& toneJson) = 0;
   virtual bool switchModel(const std::string& blockId, int modelId, const juce::var& model) = 0;

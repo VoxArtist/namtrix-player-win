@@ -47,6 +47,14 @@ juce::String ChainStore::loadLocalToneUrls(const juce::Array<juce::URL>& sources
   return localLoadResult(run([&] { return backend_.loadLocalToneUrls(sources, targetId); }));
 }
 
+juce::String ChainStore::embedLocalArtwork(const std::string& blockId, const juce::File& image) {
+  const auto res = run([&] { return backend_.embedLocalArtwork(blockId, image); });
+  const auto savedTo = res.isObject() ? res.getProperty("savedTo", "").toString() : juce::String();
+  if (savedTo.isNotEmpty()) return "Artwork saved in " + savedTo;
+  const auto error = res.isObject() ? res.getProperty("error", "").toString() : juce::String();
+  return error.isNotEmpty() ? error : "Couldn't save the artwork";
+}
+
 bool ChainStore::swapTone(const std::string& blockId, const juce::String& toneJson) {
   return run([&] { return backend_.swapTone(blockId, toneJson); });
 }

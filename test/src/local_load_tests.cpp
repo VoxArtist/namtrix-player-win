@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
+#include <functional>
 
 #if !JUCE_WINDOWS
 #include <sys/stat.h>  // chmod, for the unwritable-directory heal test
@@ -931,4 +932,280 @@ TEST(LocalArtworkTest, EmbeddedImageDoesNotChangeTheSound) {
   ASSERT_TRUE(art.isValid());
   EXPECT_EQ(art.getWidth(), 512);
   EXPECT_EQ(art.getHeight(), 512);
+}
+
+// A photo dropped on a model loaded from disk is written into that .nam as
+// its artwork (embedLocalArtwork): a 512 px centre-square JPEG data URL in
+// metadata.image, with every other byte of the file left as it was.
+
+namespace {
+
+// A landscape photo: red centre square with blue bands left and right, so a
+// correct centre crop comes out all red.
+juce::File writePhoto(const juce::File& file, juce::Colour centre, int w = 1200, int h = 800) {
+  juce::Image image(juce::Image::RGB, w, h, true);
+  image.clear(image.getBounds(), juce::Colours::blue);
+  image.clear({(w - h) / 2, 0, h, h}, centre);
+  juce::FileOutputStream out(file);
+  EXPECT_TRUE(out.openedOk());
+  out.setPosition(0);
+  out.truncate();
+  juce::PNGImageFormat().writeImageToStream(image, out);
+  return file;
+}
+
+std::string readText(const juce::File& file) {
+  juce::MemoryBlock bytes;
+  EXPECT_TRUE(file.loadFileAsData(bytes));
+  return std::string(static_cast<const char*>(bytes.getData()), bytes.getSize());
+}
+
+// The decoded metadata.image of a .nam on disk (invalid when absent).
+juce::Image embeddedImageOf(const juce::File& nam) {
+  const auto config = nlohmann::json::parse(readText(nam));
+  const auto url = config.at("metadata").value("image", std::string());
+  const std::string prefix = "data:image/jpeg;base64,";
+  if (url.rfind(prefix, 0) != 0)
+    return {};
+  juce::MemoryOutputStream jpeg;
+  EXPECT_TRUE(juce::Base64::convertFromBase64(jpeg, url.substr(prefix.size())));
+  return juce::ImageFileFormat::loadFrom(jpeg.getData(), jpeg.getDataSize());
+}
+
+bool isMostly(juce::Colour pixel, juce::Colour want) {
+  return std::abs(pixel.getRed() - want.getRed()) < 24 &&
+         std::abs(pixel.getGreen() - want.getGreen()) < 24 &&
+         std::abs(pixel.getBlue() - want.getBlue()) < 24;
+}
+
+// Loads `nam` from disk into a fresh slot; the new block's id.
+std::string loadFromDisk(TONE3000Processor& proc, const juce::File& nam) {
+  const juce::var res = proc.loadLocalTonePath(nam, {});
+  EXPECT_TRUE(res["error"].isVoid()) << res["error"].toString().toStdString();
+  EXPECT_TRUE(waitForChainLoaded(proc));
+  return res["blockId"].toString().toStdString();
+}
+
+}  // namespace
+
+TEST(LocalArtworkTest, DroppedPhotoIsSavedIntoTheNamFile) {
+  const auto dir = freshDir("drop-photo");
+  const juce::File nam = dir.getChildFile("plexi.nam");
+  ASSERT_TRUE(testFile("a2-amp-test.nam").copyFileTo(nam));
+  const std::string original = readText(nam);
+  const juce::File photo = writePhoto(dir.getChildFile("photo.png"), juce::Colours::red);
+
+  juce::MemoryBlock saved;
+  juce::File cached;
+  {
+    TONE3000Processor proc;
+    const std::string blockId = loadFromDisk(proc, nam);
+    const juce::var res = proc.embedLocalArtwork(blockId, photo);
+    ASSERT_TRUE(res["error"].isVoid()) << res["error"].toString().toStdString();
+    EXPECT_EQ(res["savedTo"].toString(), juce::String("plexi.nam"));
+
+    // In the file: a 512 px square, cropped from the photo's centre.
+    const juce::Image embedded = embeddedImageOf(nam);
+    ASSERT_TRUE(embedded.isValid());
+    EXPECT_EQ(embedded.getWidth(), 512);
+    EXPECT_EQ(embedded.getHeight(), 512);
+    EXPECT_TRUE(isMostly(embedded.getPixelAt(4, 4), juce::Colours::red));
+    EXPECT_TRUE(isMostly(embedded.getPixelAt(507, 256), juce::Colours::red));
+
+    // Every other byte as it was: the edit is one inserted member.
+    std::string edited = readText(nam);
+    const size_t at = edited.find("\"image\": ");
+    ASSERT_NE(at, std::string::npos);
+    const size_t end = edited.find("\", ", at) + 3;
+    edited.erase(at, end - at);
+    EXPECT_TRUE(edited == original) << "the rest of the file changed";
+
+    // On the tile now, from the artwork cache.
+    cached = juce::URL(artworkOf(proc)).getLocalFile();
+    ASSERT_TRUE(cached.existsAsFile());
+    EXPECT_EQ(cached.getParentDirectory(), artworkCacheDirForTest());
+    EXPECT_TRUE(static_cast<bool>(firstToneBlock(proc)["loaded"]));
+    proc.getStateInformation(saved);
+  }
+
+  {
+    // Loading the file again finds it embedded.
+    TONE3000Processor proc;
+    loadFromDisk(proc, nam);
+    EXPECT_EQ(juce::URL(artworkOf(proc)).getLocalFile(), cached);
+  }
+
+  // The saved state carries the new file's bytes: with the cache cleared,
+  // a restore re-derives the photo from them.
+  ASSERT_TRUE(cached.deleteFile());
+  TONE3000Processor restored;
+  restored.setStateInformation(saved.getData(), static_cast<int>(saved.getSize()));
+  ASSERT_TRUE(waitForChainLoaded(restored));
+  EXPECT_EQ(juce::URL(artworkOf(restored)).getLocalFile(), cached);
+  EXPECT_TRUE(cached.existsAsFile());
+  dir.deleteRecursively();
+}
+
+TEST(LocalArtworkTest, SecondPhotoReplacesTheFirst) {
+  const auto dir = freshDir("replace-photo");
+  const juce::File nam = dir.getChildFile("amp.nam");
+  ASSERT_TRUE(testFile("a2-amp-test-artwork.nam").copyFileTo(nam));  // starts with artwork
+
+  TONE3000Processor proc;
+  const std::string blockId = loadFromDisk(proc, nam);
+  for (const auto colour : {juce::Colours::green, juce::Colours::yellow}) {
+    const juce::var res =
+        proc.embedLocalArtwork(blockId, writePhoto(dir.getChildFile("photo.png"), colour, 300, 200));
+    ASSERT_TRUE(res["error"].isVoid()) << res["error"].toString().toStdString();
+    const juce::Image embedded = embeddedImageOf(nam);
+    ASSERT_TRUE(embedded.isValid());
+    EXPECT_EQ(embedded.getWidth(), 200) << "a small photo isn't upscaled";
+    EXPECT_TRUE(isMostly(embedded.getPixelAt(100, 100), colour));
+  }
+  const std::string text = readText(nam);
+  size_t count = 0;
+  for (size_t at = text.find("\"image\""); at != std::string::npos; at = text.find("\"image\"", at + 1))
+    ++count;
+  EXPECT_EQ(count, 1u);
+  dir.deleteRecursively();
+}
+
+TEST(LocalArtworkTest, DroppedPhotoWorksWithoutExistingMetadata) {
+  // Files whose metadata is absent, null or empty get one with the image.
+  juce::MemoryBlock bytes;
+  ASSERT_TRUE(testFile("a2-amp-test.nam").loadFileAsData(bytes));
+  const auto* begin = static_cast<const char*>(bytes.getData());
+  const auto base = nlohmann::json::parse(begin, begin + bytes.getSize());
+
+  const std::vector<std::pair<const char*, std::function<void(nlohmann::json&)>>> variants = {
+      {"absent", [](nlohmann::json& c) { c.erase("metadata"); }},
+      {"null", [](nlohmann::json& c) { c["metadata"] = nullptr; }},
+      {"empty", [](nlohmann::json& c) { c["metadata"] = nlohmann::json::object(); }},
+  };
+  for (const auto& [label, change] : variants) {
+    SCOPED_TRACE(label);
+    const auto dir = freshDir(juce::String("metadata-") + label);
+    nlohmann::json config = base;
+    change(config);
+    const juce::File nam = dir.getChildFile("amp.nam");
+    writeBytes(nam, config.dump(1));
+
+    TONE3000Processor proc;
+    const std::string blockId = loadFromDisk(proc, nam);
+    const juce::var res =
+        proc.embedLocalArtwork(blockId, writePhoto(dir.getChildFile("p.png"), juce::Colours::red));
+    ASSERT_TRUE(res["error"].isVoid()) << res["error"].toString().toStdString();
+    EXPECT_TRUE(embeddedImageOf(nam).isValid());
+    // Still the same model.
+    auto after = nlohmann::json::parse(readText(nam));
+    after.erase("metadata");
+    config.erase("metadata");
+    EXPECT_TRUE(after == config);
+    dir.deleteRecursively();
+  }
+}
+
+TEST(LocalArtworkTest, DroppedPhotoDoesNotChangeTheSound) {
+  const auto dir = freshDir("drop-sound");
+  const juce::File nam = dir.getChildFile("amp.nam");
+  ASSERT_TRUE(testFile("a2-amp-test.nam").copyFileTo(nam));
+  {
+    TONE3000Processor proc;
+    const std::string blockId = loadFromDisk(proc, nam);
+    ASSERT_TRUE(proc.embedLocalArtwork(blockId, writePhoto(dir.getChildFile("p.png"), juce::Colours::red))["error"].isVoid());
+  }
+
+  const auto engineFor = [](const juce::File& file) {
+    juce::MemoryBlock bytes;
+    EXPECT_TRUE(file.loadFileAsData(bytes));
+    const auto* begin = static_cast<const char*>(bytes.getData());
+    std::vector<std::unique_ptr<nam::DSP>> instances;
+    instances.push_back(nam::get_dsp(nlohmann::json::parse(begin, begin + bytes.getSize())));
+    auto engine = std::make_unique<NamEngine>(std::move(instances), 1, 1);
+    engine->prepare(512);
+    return engine;
+  };
+  auto plain = engineFor(testFile("a2-amp-test.nam"));
+  auto withArt = engineFor(nam);
+  const auto in = makeSine(512 * 20, 330.0, 0.25f);
+  juce::AudioBuffer<float> a(2, 512), b(2, 512);
+  for (size_t off = 0; off < in.size(); off += 512) {
+    for (int ch = 0; ch < 2; ++ch) {
+      a.copyFrom(ch, 0, in.data() + off, 512);
+      b.copyFrom(ch, 0, in.data() + off, 512);
+    }
+    plain->process(a);
+    withArt->process(b);
+    for (int ch = 0; ch < 2; ++ch)
+      ASSERT_EQ(std::memcmp(a.getReadPointer(ch), b.getReadPointer(ch), 512 * sizeof(float)), 0);
+  }
+  dir.deleteRecursively();
+}
+
+TEST(LocalArtworkTest, DroppedPhotoRefusalsLeaveTheFileAlone) {
+  const auto dir = freshDir("drop-refusals");
+  const juce::File nam = dir.getChildFile("amp.nam");
+  ASSERT_TRUE(testFile("a2-amp-test.nam").copyFileTo(nam));
+  const juce::File photo = writePhoto(dir.getChildFile("p.png"), juce::Colours::red);
+  const auto errorOf = [](const juce::var& res) { return res["error"].toString(); };
+
+  TONE3000Processor proc;
+  const std::string blockId = loadFromDisk(proc, nam);
+  const std::string original = readText(nam);
+
+  {
+    SCOPED_TRACE("not an image");
+    const juce::File junk = dir.getChildFile("junk.png");
+    writeBytes(junk, std::string("not a png"));
+    EXPECT_EQ(errorOf(proc.embedLocalArtwork(blockId, junk)), juce::String("Couldn't read that photo"));
+  }
+  {
+    SCOPED_TRACE("unsupported type");
+    const juce::File gif = dir.getChildFile("p.gif");
+    ASSERT_TRUE(photo.copyFileTo(gif));
+    EXPECT_EQ(errorOf(proc.embedLocalArtwork(blockId, gif)), juce::String("Drop a .jpg or .png photo"));
+  }
+  {
+    SCOPED_TRACE("no such block");
+    EXPECT_EQ(errorOf(proc.embedLocalArtwork("nope", photo)), juce::String("Drop the photo on a model"));
+  }
+#if !JUCE_WINDOWS
+  if (geteuid() != 0) {
+    SCOPED_TRACE("read-only file");
+    ASSERT_EQ(chmod(nam.getFullPathName().toRawUTF8(), 0444), 0);
+    EXPECT_EQ(errorOf(proc.embedLocalArtwork(blockId, photo)), juce::String("amp.nam is read-only"));
+    ASSERT_EQ(chmod(nam.getFullPathName().toRawUTF8(), 0644), 0);
+  }
+#endif
+  EXPECT_TRUE(readText(nam) == original);
+
+  {
+    SCOPED_TRACE("file changed since it was loaded");
+    const std::string changed = original + "\n";
+    writeBytes(nam, changed);
+    EXPECT_TRUE(errorOf(proc.embedLocalArtwork(blockId, photo)).contains("changed since it was loaded"));
+    EXPECT_TRUE(readText(nam) == changed);
+  }
+  {
+    SCOPED_TRACE("model gone from disk");
+    ASSERT_TRUE(nam.deleteFile());
+    EXPECT_TRUE(errorOf(proc.embedLocalArtwork(blockId, photo)).startsWith("Can't find amp.nam on disk"));
+  }
+  {
+    SCOPED_TRACE("loaded as bytes: no file to write");
+    TONE3000Processor other;
+    const juce::var res = other.loadLocalTone("a2-amp-test", filesOf({testFileEntry("a2-amp-test.nam")}));
+    ASSERT_TRUE(waitForChainLoaded(other));
+    EXPECT_TRUE(errorOf(other.embedLocalArtwork(res["blockId"].toString().toStdString(), photo))
+                    .startsWith("Can't find"));
+  }
+  {
+    SCOPED_TRACE("an IR");
+    TONE3000Processor other;
+    const juce::var res = other.loadLocalTonePath(testFile("cab-ir-test.wav"), {});
+    ASSERT_TRUE(waitForChainLoaded(other));
+    EXPECT_EQ(errorOf(other.embedLocalArtwork(res["blockId"].toString().toStdString(), photo)),
+              juce::String("Artwork can only be added to .nam models"));
+  }
+  dir.deleteRecursively();
 }

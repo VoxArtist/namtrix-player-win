@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #if !JUCE_WINDOWS
@@ -505,7 +506,12 @@ juce::var stashLocalFileFromDisk(const juce::File& file, juce::String& error,
     error = "Couldn't read the file";
     return {};
   }
-  return stashLocalBytes(file.getFileName(), bytes, error, artworkUrl);
+  juce::var model = stashLocalBytes(file.getFileName(), bytes, error, artworkUrl);
+  // Where the model came from, so a photo dropped on it later can be saved
+  // into the file itself (embedLocalArtwork).
+  if (auto* object = model.getDynamicObject())
+    object->setProperty("source_path", file.getFullPathName());
+  return model;
 }
 
 // A file the OS document picker handed us as a security-scoped URL.
@@ -533,6 +539,187 @@ juce::var stashLocalFileFromUrl(const juce::URL& url, juce::String& error,
     return {};
   }
   return stashLocalBytes(filename, bytes, error, artworkUrl);
+}
+
+// Writing artwork into a .nam (embedLocalArtwork). The file is edited as
+// text, not re-serialized: a parse/dump round trip would reformat every
+// weight (and nlohmann::json would reorder the keys), turning a one-key edit
+// into a rewrite of someone's model file. So a minimal scanner finds the
+// top-level "metadata" object and the "image" value inside it, and only
+// that span changes. The result is then parsed and checked against the
+// original before anything is written (sameApartFromImage).
+
+constexpr size_t kNpos = std::string::npos;
+
+size_t skipJsonSpace(const std::string& s, size_t i) {
+  while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r'))
+    ++i;
+  return i;
+}
+
+// Each skip returns the offset just past what it skipped, or kNpos.
+size_t skipJsonString(const std::string& s, size_t i) {
+  if (i >= s.size() || s[i] != '"')
+    return kNpos;
+  for (++i; i < s.size(); ++i) {
+    if (s[i] == '\\')
+      ++i;
+    else if (s[i] == '"')
+      return i + 1;
+  }
+  return kNpos;
+}
+
+size_t skipJsonValue(const std::string& s, size_t i) {
+  if (i >= s.size())
+    return kNpos;
+  if (s[i] == '"')
+    return skipJsonString(s, i);
+  if (s[i] == '{' || s[i] == '[') {
+    int depth = 0;
+    while (i < s.size()) {
+      const char c = s[i];
+      if (c == '"') {
+        i = skipJsonString(s, i);
+        if (i == kNpos)
+          return kNpos;
+        continue;
+      }
+      if (c == '{' || c == '[')
+        ++depth;
+      else if ((c == '}' || c == ']') && --depth == 0)
+        return i + 1;
+      ++i;
+    }
+    return kNpos;
+  }
+  // Number, true, false or null: up to the next delimiter.
+  const size_t start = i;
+  while (i < s.size() && s[i] != ',' && s[i] != '}' && s[i] != ']' && s[i] != ' ' &&
+         s[i] != '\t' && s[i] != '\n' && s[i] != '\r')
+    ++i;
+  return i > start ? i : kNpos;
+}
+
+struct JsonMember {
+  std::string key;  // raw, between the quotes
+  size_t valueStart = 0;
+  size_t valueEnd = 0;
+};
+
+// The members of the object whose '{' is at `open`; nullopt when malformed.
+std::optional<std::vector<JsonMember>> jsonMembers(const std::string& s, size_t open) {
+  std::vector<JsonMember> members;
+  size_t i = skipJsonSpace(s, open + 1);
+  if (i < s.size() && s[i] == '}')
+    return members;
+  while (i < s.size()) {
+    const size_t keyStart = skipJsonSpace(s, i);
+    const size_t keyEnd = skipJsonString(s, keyStart);
+    if (keyEnd == kNpos)
+      return std::nullopt;
+    i = skipJsonSpace(s, keyEnd);
+    if (i >= s.size() || s[i] != ':')
+      return std::nullopt;
+    JsonMember member;
+    member.key = s.substr(keyStart + 1, keyEnd - keyStart - 2);
+    member.valueStart = skipJsonSpace(s, i + 1);
+    member.valueEnd = skipJsonValue(s, member.valueStart);
+    if (member.valueEnd == kNpos)
+      return std::nullopt;
+    members.push_back(member);
+    i = skipJsonSpace(s, member.valueEnd);
+    if (i < s.size() && s[i] == ',') {
+      ++i;
+      continue;
+    }
+    if (i < s.size() && s[i] == '}')
+      return members;
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
+// `json` with metadata.image set to `imageValue` (JSON text): replaced when
+// present, added otherwise, creating "metadata" when the file has none (or
+// has null there). nullopt when the text isn't a JSON object.
+std::optional<std::string> withMetadataImage(const std::string& json,
+                                             const std::string& imageValue) {
+  const size_t root = skipJsonSpace(json, 0);
+  if (root >= json.size() || json[root] != '{')
+    return std::nullopt;
+  const auto members = jsonMembers(json, root);
+  if (!members)
+    return std::nullopt;
+
+  for (const auto& member : *members) {
+    if (member.key != "metadata")
+      continue;
+    if (json[member.valueStart] != '{')
+      return json.substr(0, member.valueStart) + "{\"image\": " + imageValue + "}" +
+             json.substr(member.valueEnd);
+    const auto fields = jsonMembers(json, member.valueStart);
+    if (!fields)
+      return std::nullopt;
+    for (const auto& field : *fields)
+      if (field.key == "image")
+        return json.substr(0, field.valueStart) + imageValue + json.substr(field.valueEnd);
+    const std::string entry = "\"image\": " + imageValue + (fields->empty() ? "" : ", ");
+    return json.substr(0, member.valueStart + 1) + entry + json.substr(member.valueStart + 1);
+  }
+
+  const std::string entry =
+      "\"metadata\": {\"image\": " + imageValue + "}" + (members->empty() ? "" : ", ");
+  return json.substr(0, root + 1) + entry + json.substr(root + 1);
+}
+
+// The edit's safety check: `after` carries exactly `dataUrl` as
+// metadata.image and is otherwise the same model as `before` (a metadata
+// object holding only an old image counts the same as none).
+bool sameApartFromImage(nlohmann::json before, nlohmann::json after, const std::string& dataUrl) {
+  if (!after.contains("metadata") || !after["metadata"].is_object() ||
+      after["metadata"].value("image", std::string()) != dataUrl)
+    return false;
+  const auto detachMetadata = [](nlohmann::json& config) {
+    nlohmann::json metadata = nlohmann::json::object();
+    if (config.contains("metadata") && config["metadata"].is_object()) {
+      metadata = config["metadata"];
+      metadata.erase("image");
+    }
+    config.erase("metadata");
+    return metadata;
+  };
+  return detachMetadata(before) == detachMetadata(after) && before == after;
+}
+
+// A dropped photo as NAMTRIX artwork: the centre square, at most
+// kEmbeddedArtworkSide px, as a JPEG. Halving steps before the final resize
+// keep a camera-sized photo from aliasing on the way down to 512.
+constexpr int kEmbeddedArtworkSide = 512;
+
+juce::MemoryBlock artworkJpegFrom(const juce::Image& photo) {
+  const int side = std::min(photo.getWidth(), photo.getHeight());
+  juce::Image current = photo.getClippedImage(
+      {(photo.getWidth() - side) / 2, (photo.getHeight() - side) / 2, side, side});
+  const int target = std::min(side, kEmbeddedArtworkSide);
+  while (current.getWidth() / 2 >= target)
+    current = current.rescaled(current.getWidth() / 2, current.getHeight() / 2,
+                               juce::Graphics::highResamplingQuality);
+  if (current.getWidth() != target)
+    current = current.rescaled(target, target, juce::Graphics::highResamplingQuality);
+
+  // JPEG has no alpha: a transparent PNG lands on black, like the tile behind it.
+  juce::Image rgb(juce::Image::RGB, target, target, true);
+  {
+    juce::Graphics g(rgb);
+    g.fillAll(juce::Colours::black);
+    g.drawImageAt(current, 0, 0);
+  }
+  juce::MemoryOutputStream out;
+  juce::JPEGImageFormat jpeg;
+  jpeg.setQuality(0.85f);
+  jpeg.writeImageToStream(rgb, out);
+  return out.getMemoryBlock();
 }
 
 // Shared user-facing error result for the local-load entry points.
@@ -824,6 +1011,125 @@ juce::var TONE3000Processor::finishLocalToneLoad(const juce::String& title,
   juce::DynamicObject::Ptr ok = new juce::DynamicObject();
   ok->setProperty("blockId", juce::String(blockId));
   return juce::var(ok.get());
+}
+
+juce::var TONE3000Processor::embedLocalArtwork(const std::string& blockId,
+                                               const juce::File& image) {
+  const auto fail = [](const juce::String& message) {
+    juce::Logger::writeToLog("[Artwork] " + message);
+    juce::DynamicObject::Ptr result = new juce::DynamicObject();
+    result->setProperty("error", message);
+    return juce::var(result.get());
+  };
+
+  // 1. The block's active model: its original file, and the bytes it plays.
+  juce::String sourcePath, modelName;
+  int modelId = 0;
+  std::vector<uint8_t> loadedBytes;
+  {
+    juce::ScopedLock lock(chainMutex);
+    ChainBlock* block = findBlockById(blockId);
+    if (block == nullptr || block->type == ChainBlockType::INSERT)
+      return fail("Drop the photo on a model");
+    if (!static_cast<bool>(block->toneVar["local"]))
+      return fail("Artwork can only be added to models loaded from disk");
+    if (block->toneVar["format"].toString() != "nam")
+      return fail("Artwork can only be added to .nam models");
+    modelId = block->activeModelId;
+    if (const auto* models = block->toneVar["models"].getArray())
+      for (const auto& model : *models)
+        if (static_cast<int>(model["id"]) == modelId) {
+          sourcePath = model["source_path"].toString();
+          modelName = model["name"].toString();
+        }
+    if (const auto cached = block->modelCache.find(modelId); cached != block->modelCache.end())
+      loadedBytes = cached->second;
+  }
+  if (loadedBytes.empty())
+    return fail("Wait for the model to finish loading");
+  // Chains from before source_path was recorded, and drops that arrived as
+  // bytes, don't know where the file lives.
+  if (sourcePath.isEmpty() || !juce::File::isAbsolutePath(sourcePath) ||
+      !juce::File(sourcePath).existsAsFile())
+    return fail("Can't find " + modelName +
+                ".nam on disk. Load it from its file again, then drop the photo.");
+  const juce::File source(sourcePath);
+  if (!source.hasWriteAccess())
+    return fail(source.getFileName() + " is read-only");
+
+  // 2. The photo, as NAMTRIX artwork.
+  const juce::String extension = image.getFileExtension().toLowerCase();
+  if (extension != ".jpg" && extension != ".jpeg" && extension != ".png")
+    return fail("Drop a .jpg or .png photo");
+  if (image.getSize() > kMaxLocalFileBytes)
+    return fail("That photo is too large");
+  const juce::Image photo = juce::ImageFileFormat::loadFrom(image);
+  if (!photo.isValid())
+    return fail("Couldn't read that photo");
+  const juce::MemoryBlock jpeg = artworkJpegFrom(photo);
+  const std::string dataUrl =
+      "data:image/jpeg;base64," +
+      juce::Base64::toBase64(jpeg.getData(), jpeg.getSize()).toStdString();
+
+  // 3. The edit, made only to the model the block is playing: a file
+  // retrained or replaced since it was loaded is left alone.
+  juce::MemoryBlock onDisk;
+  if (!source.loadFileAsData(onDisk))
+    return fail("Couldn't read " + source.getFileName());
+  if (onDisk.getSize() != loadedBytes.size() ||
+      std::memcmp(onDisk.getData(), loadedBytes.data(), loadedBytes.size()) != 0)
+    return fail(source.getFileName() +
+                " changed since it was loaded. Load it again, then drop the photo.");
+  const std::string original(static_cast<const char*>(onDisk.getData()), onDisk.getSize());
+  const auto edited = withMetadataImage(original, nlohmann::json(dataUrl).dump());
+  try {
+    if (!edited || !sameApartFromImage(nlohmann::json::parse(original),
+                                       nlohmann::json::parse(*edited), dataUrl))
+      return fail("Couldn't add the photo to " + source.getFileName());
+  } catch (const std::exception&) {
+    return fail("Couldn't add the photo to " + source.getFileName());
+  }
+
+  // 4. Written whole or not at all (replaceWithData goes through a temporary
+  // file next to it and renames it over the original).
+  if (!source.replaceWithData(edited->data(), edited->size()))
+    return fail("Couldn't write to " + source.getFileName());
+  juce::Logger::writeToLog("[Artwork] Saved artwork into " + source.getFullPathName());
+
+  // 5. The block follows: its stash copy and cached bytes become the new file
+  // (same weights, so the engine keeps playing untouched), which is what
+  // presets and DAW state embed from now on, and the tile shows the photo.
+  juce::MemoryOutputStream newBytes;
+  newBytes.write(edited->data(), edited->size());
+  juce::String stashError;
+  const juce::var stashed = stashLocalBytes(source.getFileName(), newBytes, stashError);
+  const juce::String artworkUrl = cacheArtworkBytes(jpeg.getData(), jpeg.getSize());
+  {
+    juce::ScopedLock lock(chainMutex);
+    ChainBlock* block = findBlockById(blockId);
+    if (block != nullptr && block->activeModelId == modelId &&
+        static_cast<bool>(block->toneVar["local"])) {
+      juce::var tone = juce::JSON::parse(block->toneJson);  // a copy: history shares toneVar
+      if (auto* object = tone.getDynamicObject()) {
+        if (stashed.isObject())
+          if (const auto* models = object->getProperty("models").getArray())
+            for (const auto& model : *models)
+              if (auto* entry = model.getDynamicObject();
+                  entry != nullptr && static_cast<int>(entry->getProperty("id")) == modelId)
+                entry->setProperty("model_url", stashed["model_url"]);
+        if (artworkUrl.isNotEmpty())
+          object->setProperty("images", juce::Array<juce::var>{juce::var(artworkUrl)});
+        setToneOnBlock(*block, block->toneId, juce::JSON::toString(tone), tone);
+        if (stashed.isObject())
+          block->modelCache[modelId] = std::vector<uint8_t>(edited->begin(), edited->end());
+        bumpChainRevision();
+      }
+    }
+  }
+
+  juce::DynamicObject::Ptr result = new juce::DynamicObject();
+  result->setProperty("savedTo", source.getFileName());
+  return juce::var(result.get());
 }
 
 void TONE3000Processor::cleanLocalModelStash() {
