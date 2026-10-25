@@ -1,0 +1,148 @@
+# NAMTRIX Player - Windows build
+#
+# Builds the VST3 and the standalone app on Windows x64, runs the DSP test
+# suite, and uploads a zip shaped like the macOS download (a "NAMTRIX Player"
+# folder with the plugin, the app and READ ME FIRST.txt). Unsigned: there is
+# no code-signing certificate, so Windows SmartScreen warns on first run.
+#
+# Distilled from build.yml (upstream TONE3000's signed multi-platform
+# release workflow), keeping only the Windows steps that need no secrets
+# besides the publishable key.
+
+name: Windows
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build:
+    name: Windows x64
+    runs-on: windows-latest
+    env:
+      # TONE3000 sign-in (OAuth client_id). Publishable, but kept as a
+      # repository secret like upstream so forks don't inherit it.
+      T3K_PUBLISHABLE_KEY: ${{ secrets.T3K_PUBLISHABLE_KEY }}
+      SCCACHE_GHA_ENABLED: "true"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # The version people see in the Player's header (plugin/ui/core/Namtrix.h),
+      # same source as script/publish_player.sh.
+      - name: Read version
+        shell: bash
+        run: |
+          version="$(sed -nE 's/.*kVersion = "([^"]+)".*/\1/p' plugin/ui/core/Namtrix.h)"
+          [ -n "$version" ] || { echo "no kVersion in Namtrix.h" >&2; exit 1; }
+          echo "NAMTRIX_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Cache CPM dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            libs/juce
+            libs/googletest
+            libs/clap-juce-extensions
+          key: cpm-deps-windows-${{ hashFiles('CMakeLists.txt', 'plugin/CMakeLists.txt') }}
+
+      # Ninja (for sccache) doesn't find MSVC on its own.
+      - name: Setup MSVC dev environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # Steinberg's ASIO SDK (headers only) for the standalone's ASIO driver
+      # option. Not redistributable, so fetched at build time.
+      - name: Download ASIO SDK
+        shell: pwsh
+        run: |
+          curl.exe -sSL -o asiosdk.zip https://www.steinberg.net/asiosdk
+          Expand-Archive asiosdk.zip -DestinationPath "$env:RUNNER_TEMP\asiosdk"
+          $sdk = (Get-ChildItem "$env:RUNNER_TEMP\asiosdk" -Directory | Select-Object -First 1).FullName
+          if (-not (Test-Path "$sdk\common\iasiodrv.h")) {
+            Write-Error "ASIO SDK layout unexpected: iasiodrv.h not found under $sdk"
+            exit 1
+          }
+          $sdk = $sdk -replace '\\', '/'
+          "ASIO_SDK_PATH=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Configure
+        shell: bash
+        run: |
+          cmake -B build -S . -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DBUILD_AAX=OFF \
+            -DASIO_SDK_PATH="$ASIO_SDK_PATH" \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+
+      - name: Build
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
+
+      - name: Run DSP tests
+        run: ctest --test-dir build/test --output-on-failure
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $artefacts = "build\plugin\TONE3000_artefacts\${{ env.BUILD_TYPE }}"
+          $stage = "$env:RUNNER_TEMP\package\NAMTRIX Player"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item -Recurse "$artefacts\VST3\NAMTRIX Player.vst3" $stage
+          Copy-Item "$artefacts\Standalone\NAMTRIX Player.exe" $stage
+          $readme = @"
+          NAMTRIX Player $env:NAMTRIX_VERSION (Windows)
+          ==============================
+
+          A plugin and standalone app that plays Neural Amp Modeler (.nam) models,
+          including parametric ones: models captured across an amp's controls, whose
+          knobs work in the Player the way they do on the real amp.
+
+          Formats
+            VST3, Standalone
+
+          Requirements
+            Windows 10 or 11, 64-bit.
+
+          Install
+            NAMTRIX Player.vst3  ->  C:\Program Files\Common Files\VST3\
+            NAMTRIX Player.exe   ->  anywhere you like (for example your Desktop)
+
+          The Player isn't code-signed, so the first time you open the app Windows
+          may show "Windows protected your PC". Click "More info", then "Run anyway".
+
+          Then restart your DAW and rescan plugins if it doesn't appear.
+
+          Credits
+            Based on the TONE3000 plugin (MIT license) and NeuralAmpModelerCoreParametric.
+          "@
+          # Strip the here-string's YAML indentation; CRLF for Notepad.
+          ($readme -split "`n" | ForEach-Object { $_ -replace '^          ', '' }) -join "`r`n" |
+            Set-Content -Encoding utf8 "$stage\READ ME FIRST.txt"
+          Compress-Archive -Path $stage -DestinationPath "build\NAMTRIX-Player-Windows.zip" -Force
+          Get-Item "build\NAMTRIX-Player-Windows.zip" | Format-List Name, Length
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: NAMTRIX-Player-${{ env.NAMTRIX_VERSION }}-Windows
+          path: build/NAMTRIX-Player-Windows.zip
+          if-no-files-found: error
